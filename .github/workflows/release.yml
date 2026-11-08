@@ -1,0 +1,23 @@
+name: Package and release
+
+# Push a tag like v1.0.1 -> the addon is zipped and uploaded to CurseForge
+# and attached to a GitHub release. The tag becomes the version in the .toc.
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CF_API_KEY: ${{ secrets.CF_API_KEY }}
+      GITHUB_OAUTH: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: BigWigsMods/packager@v2

@@ -1,0 +1,6 @@
+package-as: BetterLFG
+
+# Not part of the addon download (.git, .github and .pkgmeta are skipped automatically).
+ignore:
+  - assets
+  - README.md

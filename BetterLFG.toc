@@ -1,0 +1,10 @@
+## Interface: 16001
+## Title: Better LFG
+## Notes: A cleaner Group Finder: see all groups and players at a glance, with more info and better filters.
+## Author: flori
+## Version: @project-version@
+## SavedVariables: BetterLFGDB
+## X-Curse-Project-ID: 000000
+
+BetterLFG.lua
+Players.lua
