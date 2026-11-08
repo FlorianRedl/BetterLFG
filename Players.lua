@@ -22,6 +22,7 @@ local function NewState()
         names = {}, ids = nil, levelOnly = true,
         roles = { tank = false, healer = false, dps = false },
         minLevel = nil, maxLevel = nil,
+        minMyLevel = false,   -- "Min my level": minimum = the searching player's own level
         hiddenClasses = {},
     }
 end
@@ -42,6 +43,7 @@ local function SaveFilters()
         roles = CopySet(filters.roles),
         minLevel = filters.minLevel,
         maxLevel = filters.maxLevel,
+        minMyLevel = filters.minMyLevel,
         hiddenClasses = CopySet(filters.hiddenClasses),
     }
 end
@@ -55,6 +57,7 @@ function NS.LoadPlayerFilters()
         end
         state.minLevel = type(s.minLevel) == "number" and s.minLevel or nil
         state.maxLevel = type(s.maxLevel) == "number" and s.maxLevel or nil
+        state.minMyLevel = s.minMyLevel == true
         state.hiddenClasses = {}
         if type(s.hiddenClasses) == "table" then
             for k, v in pairs(s.hiddenClasses) do
@@ -99,7 +102,9 @@ local function Matches(e)
         if not offers then return false end
     end
     if e.soloLevel then
-        if filters.minLevel and e.soloLevel < filters.minLevel then return false end
+        -- "Min my level" replaces the typed minimum with the own (current) level.
+        local minLevel = filters.minMyLevel and UnitLevel("player") or filters.minLevel
+        if minLevel and e.soloLevel < minLevel then return false end
         if filters.maxLevel and e.soloLevel > filters.maxLevel then return false end
     end
     if e.soloClass and filters.hiddenClasses[e.soloClass] then return false end
@@ -239,6 +244,11 @@ local function Render()
     for i, e in ipairs(list) do
         local r = GetRow(i)
         r.e = e
+        -- Updated live since the last draw: flash once.
+        if e.flashAt and not e.flashedPlayers and GetTime() - e.flashAt < 2 then
+            e.flashedPlayers = true
+            NS.FlashRow(r)
+        end
         local delisted = IsDelisted(e)
         r:SetAlpha(delisted and 0.4 or 1)
         r.invite:SetEnabled(not delisted)
@@ -308,6 +318,7 @@ local function ApplyFilters()
     filters.levelOnly = pending.levelOnly
     filters.roles = CopySet(pending.roles)
     filters.minLevel, filters.maxLevel = pending.minLevel, pending.maxLevel
+    filters.minMyLevel = pending.minMyLevel
     filters.hiddenClasses = CopySet(pending.hiddenClasses)
     filters.ids = nil
     if next(pending.names) then
@@ -339,6 +350,7 @@ local function BuildFilterWindow()
     local fInset = CreateFrame("Frame", nil, filterWin, "InsetFrameTemplate")
     fInset:SetPoint("TOPLEFT", filterWin, "TOPLEFT", 8, -28)
     fInset:SetPoint("BOTTOMRIGHT", filterWin, "BOTTOMRIGHT", -6, 8)
+    filterWin.fInset = fInset
 
     -- Dungeon (multi-select) + level checkbox
     local dungeonLabel = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -383,9 +395,12 @@ local function BuildFilterWindow()
     levelCheck:SetChecked(pending.levelOnly)
     levelCheck:SetScript("OnClick", function(self) pending.levelOnly = self:GetChecked() and true or false end)
 
+    -- Languages (shared with the groups tab; applied on the next search)
+    local langDropdown = NS.CreateLanguageDropdown(filterWin, levelCheck, 4)
+
     -- Roles: show players who can play any of the ticked roles
     local roleHeader = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    roleHeader:SetPoint("TOPLEFT", levelCheck, "BOTTOMLEFT", 4, -14)
+    roleHeader:SetPoint("TOPLEFT", langDropdown, "BOTTOMLEFT", 0, -14)
     roleHeader:SetText("Looking for")
 
     local roleChecks = {}
@@ -442,31 +457,60 @@ local function BuildFilterWindow()
     local toBox = MakeBox("maxLevel")
     toBox:SetPoint("LEFT", toText, "RIGHT", 8, 0)
 
-    -- Classes (multi-select; all ticked = no filter)
+    -- "Min my level": the minimum becomes the searching player's own level.
+    local myLevelCheck = CreateFrame("CheckButton", nil, filterWin, "UICheckButtonTemplate")
+    myLevelCheck:SetSize(24, 24)
+    myLevelCheck:SetPoint("LEFT", toBox, "RIGHT", 14, 0)
+    myLevelCheck.Text:SetText("Min my level")
+    myLevelCheck.Text:SetFontObject("GameFontNormalSmall")
+    local function UpdateMinBox()
+        -- The typed minimum does not apply while the box is ticked.
+        fromBox:SetEnabled(not pending.minMyLevel)
+        fromBox:SetAlpha(pending.minMyLevel and 0.4 or 1)
+    end
+    myLevelCheck:SetChecked(pending.minMyLevel)
+    myLevelCheck:SetScript("OnClick", function(self)
+        pending.minMyLevel = self:GetChecked() and true or false
+        UpdateMinBox()
+    end)
+    myLevelCheck:SetScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Min my level", 1, 1, 1)
+        GameTooltip:AddLine("Only players at least your own level (currently " .. UnitLevel("player") .. ").", 0.8, 0.8, 0.8, true)
+        GameTooltip:Show()
+    end)
+    myLevelCheck:SetScript("OnLeave", GameTooltip_Hide)
+    UpdateMinBox()
+
+    -- Classes: one checkbox each, 3 per row (all ticked = no filter).
     local classLabel = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     classLabel:SetPoint("TOPLEFT", fromBox, "BOTTOMLEFT", -6, -16)
     classLabel:SetText("Class")
 
-    local classDropdown = CreateFrame("DropdownButton", nil, filterWin, "WowStyle1DropdownTemplate")
-    classDropdown:SetWidth(270)
-    classDropdown:SetPoint("TOPLEFT", classLabel, "BOTTOMLEFT", 0, -6)
-    local function UpdateClassText()
-        local hidden = 0
-        for _ in pairs(pending.hiddenClasses) do hidden = hidden + 1 end
-        classDropdown:SetDefaultText(hidden == 0 and "All classes" or (hidden .. " classes hidden"))
+    local classChecks = {}
+    local COLS, COL_WIDTH, ROW_HEIGHT_CB = 3, 96, 24
+    for i, cls in ipairs(NS.ClassOrder({})) do
+        local col, row = (i - 1) % COLS, math.floor((i - 1) / COLS)
+        local cb = CreateFrame("CheckButton", nil, filterWin, "UICheckButtonTemplate")
+        cb:SetSize(24, 24)
+        cb:SetPoint("TOPLEFT", classLabel, "BOTTOMLEFT", -2 + col * COL_WIDTH, -4 - row * ROW_HEIGHT_CB)
+        local icon = filterWin:CreateTexture(nil, "ARTWORK")
+        icon:SetSize(16, 16)
+        icon:SetTexture("Interface\\GLUES\\CHARACTERCREATE\\UI-CHARACTERCREATE-CLASSES")
+        local coords = CLASS_ICON_TCOORDS and CLASS_ICON_TCOORDS[cls]
+        if coords then icon:SetTexCoord(unpack(coords)) end
+        icon:SetPoint("LEFT", cb, "RIGHT", 0, 0)
+        local text = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        text:SetPoint("LEFT", icon, "RIGHT", 3, 0)
+        text:SetText(NS.ClassName(cls))
+        local color = RAID_CLASS_COLORS and RAID_CLASS_COLORS[cls]
+        if color then text:SetTextColor(color.r, color.g, color.b) end
+        cb:SetChecked(not pending.hiddenClasses[cls])
+        cb:SetScript("OnClick", function(self)
+            pending.hiddenClasses[cls] = (not self:GetChecked()) or nil
+        end)
+        classChecks[cls] = cb
     end
-    UpdateClassText()
-    classDropdown:SetupMenu(function(_, root)
-        for _, cls in ipairs(NS.ClassOrder({})) do
-            local label = (NS.ClassMarkup(cls) or "") .. " " .. NS.ClassName(cls)
-            root:CreateCheckbox(label,
-                function() return not pending.hiddenClasses[cls] end,
-                function()
-                    pending.hiddenClasses[cls] = (not pending.hiddenClasses[cls]) or nil
-                    UpdateClassText()
-                end)
-        end
-    end)
 
     -- Bottom bar: [Reset filters] [gear] ........ [Search]
     local searchBtn = CreateFrame("Button", nil, filterWin, "UIPanelButtonTemplate")
@@ -481,7 +525,7 @@ local function BuildFilterWindow()
         NS.Refresh(filters)
     end)
 
-    -- Resets everything except the dungeon selection.
+    -- Resets every filter to its default, including dungeons and languages.
     local resetBtn = CreateFrame("Button", nil, filterWin, "UIPanelButtonTemplate")
     resetBtn:SetSize(100, 24)
     resetBtn:SetPoint("BOTTOMLEFT", 16, 14)
@@ -490,11 +534,23 @@ local function BuildFilterWindow()
         for _, state in ipairs({ pending, filters }) do
             state.roles = { tank = false, healer = false, dps = false }
             state.minLevel, state.maxLevel = nil, nil
+            state.minMyLevel = false
             state.hiddenClasses = {}
         end
         for _, cb in pairs(roleChecks) do cb:SetChecked(false) end
         fromBox:SetText(""); toBox:SetText("")
-        UpdateClassText()
+        myLevelCheck:SetChecked(false)
+        UpdateMinBox()
+        -- Dungeons: all, only for my level (the default).
+        wipe(pending.names)
+        filters.ids = nil
+        pending.levelOnly, filters.levelOnly = true, true
+        levelCheck:SetChecked(true)
+        UpdateDungeonText()
+        -- Languages: all (shared with the groups tab).
+        NS.ResetLanguages()
+        langDropdown.Refresh()
+        for _, cb in pairs(classChecks) do cb:SetChecked(true) end
         SaveFilters()
         Render()
     end)
@@ -604,6 +660,7 @@ local function BuildPanel()
     panel:SetScript("OnShow", function()
         if NS.groupsPanel then NS.groupsPanel:Hide() end
         NS.RaiseAbove(panel)
+        NS.FixFilterBorder(filterWin)
         tab:SetChecked(true)
         Render()
         NS.Refresh(filters)   -- runs inside the tab click, so the search is allowed

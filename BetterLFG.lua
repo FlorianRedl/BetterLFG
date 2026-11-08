@@ -262,6 +262,7 @@ local REQUEST_COOLDOWN = 30   -- seconds before the same player is asked again
 local PENDING_TIME = 5        -- seconds we show "..." while waiting for an answer
 local ilvlCache, ilvlRequested = {}, {}
 local hoveredRow
+local unitTooltipName   -- player whose world tooltip is showing (to refresh it on an answer)
 
 if C_ChatInfo and C_ChatInfo.RegisterAddonMessagePrefix then
     C_ChatInfo.RegisterAddonMessagePrefix(PREFIX)
@@ -338,6 +339,9 @@ local function ShowMyGearTooltip(owner)
             GameTooltip:AddDoubleLine(s[2] .. ":  -", "", 0.5, 0.5, 0.5)
         end
     end
+    GameTooltip:AddLine(" ")
+    GameTooltip:AddLine("Players who also use Better LFG see your item level in their group tooltip - and you see theirs.",
+        0.4, 0.8, 1, true)
     GameTooltip:Show()
 
     -- Red bar behind each flagged line (placed after Show, when the lines are laid out).
@@ -417,6 +421,22 @@ local function AnnotateItemLevels(tt)
     Annotate(tt.Leader)
     if tt.memberPool then for row in tt.memberPool:EnumerateActive() do Annotate(row) end end
     WidenTooltip(tt)
+
+    -- Footer note on Blizzard's tooltip, only while WE show it (hidden with the tooltip,
+    -- so Blizzard's own Browse tab never shows a stale note).
+    if not tt.BetterLFGNote then
+        tt.BetterLFGNote = tt:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        tt.BetterLFGNote:SetJustifyH("LEFT")
+        tt.BetterLFGNote:SetTextColor(0.4, 0.8, 1)
+        tt:HookScript("OnHide", function(self) self.BetterLFGNote:Hide() end)
+    end
+    local note = tt.BetterLFGNote
+    note:ClearAllPoints()
+    note:SetPoint("BOTTOMLEFT", tt, "BOTTOMLEFT", 11, 10)
+    note:SetWidth(tt:GetWidth() - 22)
+    note:SetText("iLvl is only shown for players who also use Better LFG.")
+    note:Show()
+    tt:SetHeight(tt:GetHeight() + note:GetStringHeight() + 6)
 end
 
 local function HideRowTooltip()
@@ -508,14 +528,108 @@ end
 ---------------------------------------------------------------------------
 -- Whisper actions and settings
 ---------------------------------------------------------------------------
-local DEFAULT_WHISPER = "Hi! I'd like to join your group."
+local DEFAULT_WHISPER = "Hi! I'm a level %level% %race% %class%. Can I join your group for %dungeon%?"
+
+-- Default texts per language (Settings -> "Restore default text").
+local DEFAULT_WHISPERS = {
+    { code = "en", label = "English", text = DEFAULT_WHISPER },
+    { code = "de", label = "Deutsch",
+      text = "Hi! Ich bin %class% (%race%, Stufe %level%). Kann ich für %dungeon% in eure Gruppe?" },
+    { code = "es", label = "Español",
+      text = "¡Hola! Soy %class% (%race%, nivel %level%). ¿Puedo unirme a vuestro grupo para %dungeon%?" },
+    { code = "fr", label = "Français",
+      text = "Salut ! Je suis %class% (%race%, niveau %level%). Je peux rejoindre votre groupe pour %dungeon% ?" },
+}
 local WHISPER_COOLDOWN = 3
 local lastWhisperAt = 0
 
+-- The text the player saved (with placeholders), or the default.
+-- Earlier default texts: a player who never changed them gets the current default.
+local OLD_DEFAULTS = {
+    ["Hi! I'd like to join your group."] = true,
+    ["Hi! I'm a level %level% %race% %class%. Can I join your group?"] = true,
+}
 local function GetWhisperText()
     local t = BetterLFGDB and BetterLFGDB.whisperText
-    if type(t) ~= "string" then return DEFAULT_WHISPER end
+    if type(t) ~= "string" or OLD_DEFAULTS[t] then return DEFAULT_WHISPER end
     return t
+end
+
+-- The dungeon(s) of the group being whispered. A group can be listed for several
+-- dungeons: those that match the player's dungeon filter are named; without a match
+-- (or without a filter) all of the group's dungeons, joined with " / ".
+local function DungeonText(e)
+    if not e then return nil end
+    local names, seen = {}, {}
+    local function Add(id)
+        local a = C_LFGList.GetActivityInfoTable(id)
+        local n = a and (a.fullName or a.shortName)
+        if n and not seen[n] then
+            seen[n] = true
+            table.insert(names, n)
+        end
+    end
+    if filters.ids then
+        for _, id in ipairs(e.activityIDs or {}) do
+            if filters.ids[id] then Add(id) end
+        end
+    end
+    if #names == 0 then
+        for _, id in ipairs(e.activityIDs or {}) do Add(id) end
+    end
+    if #names == 0 and e.activity and e.activity ~= "" then names[1] = e.activity end
+    if #names == 0 then return nil end
+    return table.concat(names, " / ")
+end
+
+-- Placeholders, filled in from the player's character when the message is sent.
+-- Race and class are English, so an English text reads right on any client - unless a
+-- default text in the client's own language was chosen (e.g. German text on a German
+-- client), then the client's own (localized) names are used. Other languages' names
+-- are not available from the client, so they fall back to English.
+local function UseClientNames()
+    local lang = BetterLFGDB and BetterLFGDB.whisperLang
+    return lang and lang ~= "en" and (GetLocale() or ""):sub(1, 2) == lang
+end
+
+local function EnglishClass()
+    local localized, classFile = UnitClass("player")
+    if UseClientNames() and localized then return localized end
+    if not classFile then return "" end
+    if classFile == "DEATHKNIGHT" then return "Death Knight" end
+    if classFile == "DEMONHUNTER" then return "Demon Hunter" end
+    return classFile:sub(1, 1) .. classFile:sub(2):lower()
+end
+
+local function EnglishRace()
+    local localized, raceFile = UnitRace("player")
+    if UseClientNames() and localized then return localized end
+    if not raceFile then return "" end
+    if raceFile == "Scourge" then return "Undead" end
+    return (raceFile:gsub("(%l)(%u)", "%1 %2"))   -- "NightElf" -> "Night Elf"
+end
+
+local PLACEHOLDERS = {
+    { "%level%", function() return tostring(UnitLevel("player")) end, "your level" },
+    { "%race%",  EnglishRace,  "your race" },
+    { "%class%", EnglishClass, "your class" },
+    { "%name%",  function() return UnitName("player") or "" end, "your name" },
+    { "%ilvl%",  function() return tostring(MyItemLevel() or "?") end, "your item level" },
+    -- Without a group (settings preview) a sample name is shown.
+    { "%dungeon%", function(e)
+        if not e then return "[dungeon]" end
+        return DungeonText(e) or "your dungeon"
+    end, "the group's dungeon(s)" },
+}
+
+-- `e` is the group being whispered (nil for the settings preview).
+local function FormatWhisper(text, e)
+    for _, p in ipairs(PLACEHOLDERS) do
+        local pattern = p[1]:gsub("%%", "%%%%")              -- "%level%" as a literal pattern
+        local value = p[2](e):gsub("%%", "%%%%")             -- keep any "%" in the value literal
+        text = text:gsub(pattern, value)
+    end
+    return text
 end
 
 -- The leader's name, read live from the listing; nil when it is gone or not readable
@@ -548,7 +662,7 @@ function WhisperLeader(e)
         print("|cffffd100Better LFG|r: the leader's name is not available right now.")
         return
     end
-    local text = GetWhisperText()
+    local text = FormatWhisper(GetWhisperText(), e)
     if text == "" then
         print("|cffffd100Better LFG|r: no whisper text set (gear button in the filter window).")
         return
@@ -594,31 +708,109 @@ function BuildSettings()
     hint:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -4)
     hint:SetText("Sent to the group leader when you click the speech bubble in the group list.")
 
-    local edit = CreateFrame("EditBox", nil, f, "InputBoxTemplate")
-    edit:SetSize(460, 22)
-    edit:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 6, -8)
+    -- Larger, multi-line text box (wraps; Enter just leaves the box, a whisper is one line).
+    local box = CreateFrame("Frame", nil, f, "BackdropTemplate")
+    box:SetSize(600, 64)
+    box:SetPoint("TOPLEFT", hint, "BOTTOMLEFT", 0, -8)
+    box:SetBackdrop({
+        bgFile = "Interface\\Tooltips\\UI-Tooltip-Background",
+        edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+        tile = true, tileSize = 16, edgeSize = 14,
+        insets = { left = 3, right = 3, top = 3, bottom = 3 },
+    })
+    box:SetBackdropColor(0, 0, 0, 0.6)
+    box:SetBackdropBorderColor(0.6, 0.6, 0.6, 1)
+
+    local edit = CreateFrame("EditBox", nil, box)
+    edit:SetMultiLine(true)
+    edit:SetFontObject(ChatFontNormal)
+    edit:SetPoint("TOPLEFT", 8, -7)
+    edit:SetPoint("BOTTOMRIGHT", -8, 7)
+    edit:SetWidth(584)
     edit:SetAutoFocus(false)
     edit:SetMaxLetters(255)
+    edit:SetScript("OnEnterPressed", edit.ClearFocus)
+    edit:SetScript("OnEscapePressed", edit.ClearFocus)
+    box:EnableMouse(true)
+    box:SetScript("OnMouseDown", function() edit:SetFocus() end)
+
+    -- Placeholder list and a live preview of what will actually be sent.
+    local parts = {}
+    for _, p in ipairs(PLACEHOLDERS) do
+        table.insert(parts, "|cffffd100" .. p[1] .. "|r " .. p[3])
+    end
+    local help = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    help:SetPoint("TOPLEFT", box, "BOTTOMLEFT", 0, -44)   -- below the "Restore default text" dropdown
+    help:SetWidth(600)
+    help:SetJustifyH("LEFT")
+    help:SetText("Placeholders:  " .. table.concat(parts, ",   "))
+
+    local preview = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    preview:SetPoint("TOPLEFT", help, "BOTTOMLEFT", 0, -10)
+    preview:SetWidth(600)
+    preview:SetJustifyH("LEFT")
+    local function UpdatePreview()
+        preview:SetText("Preview:  |cffffffff" .. FormatWhisper(edit:GetText()) .. "|r")
+    end
+
     edit:SetScript("OnTextChanged", function(self, userInput)
         if userInput then
             BetterLFGDB = BetterLFGDB or {}
-            BetterLFGDB.whisperText = self:GetText()
+            -- A whisper is a single line: line breaks become spaces.
+            BetterLFGDB.whisperText = (self:GetText():gsub("[\r\n]+", " "))
+        end
+        UpdatePreview()
+    end)
+
+    -- "Restore default text" in one of several languages.
+    local restore = CreateFrame("DropdownButton", nil, f, "WowStyle1DropdownTemplate")
+    restore:SetWidth(190)
+    restore:SetPoint("TOPLEFT", box, "BOTTOMLEFT", 0, -8)
+    restore:SetDefaultText("Restore default text")
+    restore:SetupMenu(function(_, root)
+        for _, d in ipairs(DEFAULT_WHISPERS) do
+            root:CreateButton(d.label, function()
+                BetterLFGDB = BetterLFGDB or {}
+                BetterLFGDB.whisperText = d.text
+                BetterLFGDB.whisperLang = d.code
+                edit:SetText(d.text)
+            end)
         end
     end)
-    edit:SetScript("OnEnterPressed", edit.ClearFocus)
-    edit:SetScript("OnEscapePressed", edit.ClearFocus)
 
-    local reset = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
-    reset:SetSize(120, 22)
-    reset:SetPoint("LEFT", edit, "RIGHT", 10, 0)
-    reset:SetText("Default text")
-    reset:SetScript("OnClick", function()
+    -- Item level in the normal player tooltip (off by default).
+    local unitCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    unitCheck:SetPoint("TOPLEFT", preview, "BOTTOMLEFT", -4, -24)
+    unitCheck.Text:SetText("Show item level in player tooltips (hovering a character in the world)")
+    unitCheck:SetScript("OnClick", function(self)
         BetterLFGDB = BetterLFGDB or {}
-        BetterLFGDB.whisperText = DEFAULT_WHISPER
-        edit:SetText(DEFAULT_WHISPER)
+        BetterLFGDB.unitTooltipIlvl = self:GetChecked() and true or false
     end)
+    local unitHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    unitHint:SetPoint("TOPLEFT", unitCheck, "BOTTOMLEFT", 30, -2)
+    unitHint:SetWidth(560)
+    unitHint:SetJustifyH("LEFT")
+    unitHint:SetText("Players near you are inspected directly (works for everyone). Further away, only players of your faction who also use Better LFG.")
 
-    f:SetScript("OnShow", function() edit:SetText(GetWhisperText()) end)
+    -- Green flash on rows that changed live (on by default).
+    local flashCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    flashCheck:SetPoint("TOPLEFT", unitHint, "BOTTOMLEFT", -30, -16)
+    flashCheck.Text:SetText("Highlight live updates")
+    flashCheck:SetScript("OnClick", function(self)
+        BetterLFGDB = BetterLFGDB or {}
+        BetterLFGDB.flashUpdates = self:GetChecked() and true or false
+    end)
+    local flashHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    flashHint:SetPoint("TOPLEFT", flashCheck, "BOTTOMLEFT", 30, -2)
+    flashHint:SetWidth(560)
+    flashHint:SetJustifyH("LEFT")
+    flashHint:SetText("A row flashes green for a moment when its group or player changes - e.g. someone joined, a role was filled, or it was delisted.")
+
+    f:SetScript("OnShow", function()
+        edit:SetText(GetWhisperText())
+        unitCheck:SetChecked(BetterLFGDB and BetterLFGDB.unitTooltipIlvl == true)
+        flashCheck:SetChecked(not (BetterLFGDB and BetterLFGDB.flashUpdates == false))
+    end)
 
     settingsCategory = Settings.RegisterCanvasLayoutCategory(f, "Better LFG")
     Settings.RegisterAddOnCategory(settingsCategory)
@@ -648,12 +840,171 @@ comm:SetScript("OnEvent", function(_, _, prefix, message, channel, sender)
     if il then
         ilvlCache[who] = { ilvl = il, t = GetTime() }
         if hoveredRow and hoveredRow:IsMouseOver() then ShowRowTooltip(hoveredRow) end
+        -- The world tooltip of that player is open: redraw it with the answer.
+        if unitTooltipName == who and GameTooltip:IsShown() and GameTooltip.RefreshData then
+            pcall(GameTooltip.RefreshData, GameTooltip)
+        end
     end
 end)
 
 ---------------------------------------------------------------------------
+-- Item level in the normal player tooltip (option, off by default)
+---------------------------------------------------------------------------
+-- Two ways to get another player's item level:
+--  1. INSPECT (players in inspect range, ~28 yards): NotifyInspect -> INSPECT_READY ->
+--     read their equipped items. Works for everyone, no addon needed on their side.
+--  2. The addon message (see above), for players further away who use Better LFG.
+local INSPECT_GAP = 1.5          -- seconds between inspects (the server throttles them)
+local INSPECT_TIMEOUT = 3
+local lastInspectAt = 0
+local inspecting                 -- { guid, name, t } of the inspect in flight
+
+local function InspectedItemLevel(unit)
+    if C_PaperDollInfo and C_PaperDollInfo.GetInspectItemLevel then
+        local il = C_PaperDollInfo.GetInspectItemLevel(unit)
+        if il and canaccessvalue(il) and il > 0 then return math.floor(il + 0.5) end
+    end
+    local sum, n = 0, 0
+    for _, s in ipairs(GEAR_SLOTS) do
+        local link = GetInventoryItemLink(unit, s[1])
+        if link and canaccessvalue(link) then
+            local il = (C_Item and C_Item.GetDetailedItemLevelInfo and C_Item.GetDetailedItemLevelInfo(link))
+                or (GetDetailedItemLevelInfo and GetDetailedItemLevelInfo(link))
+                or select(4, GetItemInfo(link))
+            if il then sum = sum + il; n = n + 1 end
+        end
+    end
+    return n > 0 and math.floor(sum / n + 0.5) or nil
+end
+
+-- Starts an inspect if the unit is in range; true when one was started (or is running).
+local function TryInspect(unit, name)
+    if inspecting and inspecting.name == name and GetTime() - inspecting.t < INSPECT_TIMEOUT then
+        return true
+    end
+    if InCombatLockdown() then return false end
+    if InspectFrame and InspectFrame:IsShown() then return false end   -- don't disturb a manual inspect
+    if not CanInspect or not CanInspect(unit) then return false end
+    local ok, inRange = pcall(CheckInteractDistance, unit, 1)          -- 1 = inspect distance
+    if not ok or not inRange then return false end
+    if GetTime() - lastInspectAt < INSPECT_GAP then return false end
+    local guid = UnitGUID(unit)
+    if not guid or not canaccessvalue(guid) then return false end
+    lastInspectAt = GetTime()
+    inspecting = { guid = guid, name = name, t = GetTime() }
+    if not pcall(NotifyInspect, unit) then
+        inspecting = nil
+        return false
+    end
+    return true
+end
+
+local inspectFrame = CreateFrame("Frame")
+inspectFrame:RegisterEvent("INSPECT_READY")
+inspectFrame:SetScript("OnEvent", function(_, _, guid)
+    if not inspecting or guid ~= inspecting.guid then return end
+    local name = inspecting.name
+    inspecting = nil
+    -- Find a unit token that still points at that player.
+    local unit = UnitTokenFromGUID and UnitTokenFromGUID(guid)
+    if not unit then
+        for _, u in ipairs({ "mouseover", "target", "focus" }) do
+            if UnitGUID(u) == guid then unit = u break end
+        end
+    end
+    local il = unit and InspectedItemLevel(unit)
+    if not (InspectFrame and InspectFrame:IsShown()) and ClearInspectPlayer then ClearInspectPlayer() end
+    if il then
+        ilvlCache[name] = { ilvl = il, t = GetTime() }
+        if unitTooltipName == name and GameTooltip:IsShown() and GameTooltip.RefreshData then
+            pcall(GameTooltip.RefreshData, GameTooltip)
+        end
+    end
+end)
+
+local function AddUnitItemLevel(tooltip)
+    if not (BetterLFGDB and BetterLFGDB.unitTooltipIlvl) then return end
+    if tooltip ~= GameTooltip or not tooltip.GetUnit then return end
+    local _, unit = tooltip:GetUnit()
+    if not unit or not canaccessvalue(unit) then return end
+    local isPlayer = UnitIsPlayer(unit)
+    if not canaccessvalue(isPlayer) or not isPlayer then return end
+
+    local il, state
+    if UnitIsUnit(unit, "player") then
+        il = MyItemLevel()
+    else
+        local name = GetUnitName(unit, true)
+        if not name or not canaccessvalue(name) then return end
+        name = ShortName(name)
+        unitTooltipName = name
+        local c = ilvlCache[name]
+        if c and GetTime() - c.t < ILVL_TTL then
+            il = c.ilvl
+        elseif TryInspect(unit, name) then
+            state = "pending"
+        else
+            -- Out of inspect range: ask via addon message (own faction only,
+            -- addon whispers don't reach the other faction).
+            local theirs, mine = UnitFactionGroup(unit), UnitFactionGroup("player")
+            if canaccessvalue(theirs) and theirs == mine then
+                il, state = ItemLevelFor(name)
+            else
+                state = "range"
+            end
+        end
+    end
+
+    if il then
+        tooltip:AddLine("Item Level: |cffffffff" .. il .. "|r", 0.4, 0.8, 1)
+    elseif state == "pending" then
+        tooltip:AddLine("Item Level: |cff808080...|r", 0.4, 0.8, 1)
+    elseif state == "range" then
+        tooltip:AddLine("Item Level: |cff808080? (too far away)|r", 0.4, 0.8, 1)
+    else
+        tooltip:AddLine("Item Level: |cff808080? (too far away, no Better LFG)|r", 0.4, 0.8, 1)
+    end
+    tooltip:Show()
+end
+
+if TooltipDataProcessor and TooltipDataProcessor.AddTooltipPostCall and Enum.TooltipDataType then
+    TooltipDataProcessor.AddTooltipPostCall(Enum.TooltipDataType.Unit, function(tooltip)
+        pcall(AddUnitItemLevel, tooltip)
+    end)
+elseif GameTooltip:HasScript("OnTooltipSetUnit") then
+    GameTooltip:HookScript("OnTooltipSetUnit", function(tooltip) pcall(AddUnitItemLevel, tooltip) end)
+end
+
+---------------------------------------------------------------------------
 -- Rendering
 ---------------------------------------------------------------------------
+-- A short green flash over a row (used when a listing was updated live).
+function NS.FlashRow(row)
+    -- Option "Highlight live updates" (on by default).
+    if BetterLFGDB and BetterLFGDB.flashUpdates == false then return end
+    if not row.flashAnim then
+        local t = row:CreateTexture(nil, "BACKGROUND", nil, 2)
+        t:SetAllPoints()
+        t:SetColorTexture(0.3, 0.9, 0.4, 1)
+        t:SetAlpha(0)
+        local ag = t:CreateAnimationGroup()
+        local fadeIn = ag:CreateAnimation("Alpha")
+        fadeIn:SetFromAlpha(0)
+        fadeIn:SetToAlpha(0.15)
+        fadeIn:SetDuration(0.15)
+        fadeIn:SetOrder(1)
+        local fadeOut = ag:CreateAnimation("Alpha")
+        fadeOut:SetFromAlpha(0.15)
+        fadeOut:SetToAlpha(0)
+        fadeOut:SetDuration(0.9)
+        fadeOut:SetOrder(2)
+        ag:SetScript("OnFinished", function() t:SetAlpha(0) end)
+        row.flashAnim = ag
+    end
+    row.flashAnim:Stop()
+    row.flashAnim:Play()
+end
+
 local function GetRow(i)
     local r = rows[i]
     if r then return r end
@@ -722,7 +1073,7 @@ local function GetRow(i)
     r.whisper:SetScript("OnEnter", function(self)
         GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
         GameTooltip:SetText("Whisper the leader", 1, 1, 1)
-        GameTooltip:AddLine(GetWhisperText(), 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine(FormatWhisper(GetWhisperText(), self:GetParent().e), 0.8, 0.8, 0.8, true)
         GameTooltip:AddLine("Change the text in the settings (gear in the filter window).", 0.5, 0.5, 0.5, true)
         GameTooltip:Show()
     end)
@@ -807,6 +1158,11 @@ function Render()
             shown = shown + 1
             local r = GetRow(shown)
             r.e = e
+            -- Updated live since the last draw: flash once (only while the tab is visible).
+            if e.flashAt and not e.flashedGroups and panel:IsShown() and GetTime() - e.flashAt < 2 then
+                e.flashedGroups = true
+                NS.FlashRow(r)
+            end
             r.leader:SetText(e.leader)
             if e.color then
                 r.leader:SetTextColor(e.color.r, e.color.g, e.color.b)
@@ -905,17 +1261,8 @@ local function AverageLevel(id, numMembers, leaderInfo)
     return nil
 end
 
-local function Collect()
-    local ids = C_LFGList.GetSearchResults()
-    -- Some builds return (count, ids), others just ids.
-    if type(ids) ~= "table" then
-        local _, second = C_LFGList.GetSearchResults()
-        ids = second
-    end
-    for _, id in ipairs(ids or {}) do
-        local info = C_LFGList.GetSearchResultInfo(id)
-        if info and Readable(info.isDelisted, false) ~= true and not (search.seen and search.seen[id]) then
-            if search.seen then search.seen[id] = true end
+-- Everything the lists show about one search result, read fresh from the client.
+local function BuildEntry(id, info)
             local actIDs = Readable(info.activityIDs, nil) or {}
             local activity = ""
             if actIDs[1] and C_LFGList.GetActivityInfoTable then
@@ -941,7 +1288,7 @@ local function Collect()
             if ps ~= nil and GetGeneralPlaystyleString then
                 playstyle = GetGeneralPlaystyleString(ps) or ""
             end
-            table.insert(results, {
+            return {
                 id = id,
                 title = Readable(info.name, "(hidden)"),
                 activity = activity,
@@ -959,9 +1306,40 @@ local function Collect()
                 numMembers = type(numMembers) == "number" and numMembers or nil,
                 members = numMembers and tostring(numMembers) or "",
                 counts = Readable(C_LFGList.GetSearchResultMemberCounts(id), nil),
-            })
+            }
+end
+
+local resultIndex = {}   -- result id -> position in `results`
+
+local function Collect()
+    local ids = C_LFGList.GetSearchResults()
+    -- Some builds return (count, ids), others just ids.
+    if type(ids) ~= "table" then
+        local _, second = C_LFGList.GetSearchResults()
+        ids = second
+    end
+    wipe(resultIndex)
+    for _, id in ipairs(ids or {}) do
+        local info = C_LFGList.GetSearchResultInfo(id)
+        if info and Readable(info.isDelisted, false) ~= true and not (search.seen and search.seen[id]) then
+            if search.seen then search.seen[id] = true end
+            table.insert(results, BuildEntry(id, info))
+            resultIndex[id] = #results
         end
     end
+end
+
+-- A listing changed after the search (members joined/left, roles, delisted ...):
+-- re-read it in place and mark it, so its row flashes green once.
+local function UpdateEntry(id)
+    local i = resultIndex[id]
+    if not i or not results[i] or results[i].id ~= id then return false end
+    local info = C_LFGList.GetSearchResultInfo(id)
+    if not info then return false end
+    local fresh = BuildEntry(id, info)
+    fresh.flashAt = GetTime()
+    results[i] = fresh
+    return true
 end
 
 -- C_LFGList.Search only works when called directly from a click (hardware event); a call
@@ -971,6 +1349,116 @@ end
 local debugSearch = false
 local function dprint(...)
     if debugSearch then print("|cff88ccffOG|r", ...) end
+end
+
+---------------------------------------------------------------------------
+-- Languages (server-side search filter, shared by both tabs)
+---------------------------------------------------------------------------
+-- Results carry no language, so this goes into C_LFGList.Search. Without it the
+-- server only returns listings in the client's own language (tested by LFGForever),
+-- which is why players with different client languages see different groups.
+-- The game's own language is always included ("locked"). Saved as the set of
+-- unticked languages, so by default every offered language is searched.
+local LANGUAGE_NAMES = {
+    enUS = "English", enGB = "English", deDE = "German", frFR = "French",
+    esES = "Spanish", esMX = "Spanish (Latin America)", ptBR = "Portuguese",
+    itIT = "Italian", ruRU = "Russian", koKR = "Korean",
+    zhCN = "Chinese (Simplified)", zhTW = "Chinese (Traditional)",
+}
+
+local function OfferedLanguages()
+    local offered, seen = {}, {}
+    local answer = C_LFGList.GetAvailableLanguageSearchFilter and C_LFGList.GetAvailableLanguageSearchFilter()
+    if type(answer) ~= "table" then return offered end
+    for _, code in ipairs(answer) do
+        if type(code) == "string" and not seen[code] then
+            seen[code] = true
+            table.insert(offered, code)
+        end
+    end
+    return offered
+end
+
+local function LockedLanguages()
+    local locked = {}
+    local defaults = C_LFGList.GetDefaultLanguageSearchFilter and C_LFGList.GetDefaultLanguageSearchFilter()
+    if type(defaults) == "table" then
+        for code, on in pairs(defaults) do
+            if on then locked[code] = true end
+        end
+    end
+    return locked
+end
+
+local function HiddenLanguages()
+    BetterLFGDB = BetterLFGDB or {}
+    if type(BetterLFGDB.hiddenLanguages) ~= "table" then BetterLFGDB.hiddenLanguages = {} end
+    return BetterLFGDB.hiddenLanguages
+end
+
+-- The table C_LFGList.Search expects ({ deDE = true, enUS = true, ... }), or nil.
+local function LanguageSearchFilter()
+    local hidden, locked = HiddenLanguages(), LockedLanguages()
+    local filter, any = {}, false
+    for _, code in ipairs(OfferedLanguages()) do
+        if locked[code] or not hidden[code] then
+            filter[code] = true
+            any = true
+        end
+    end
+    return any and filter or nil
+end
+
+-- Back to the default: every offered language ticked.
+function NS.ResetLanguages()
+    wipe(HiddenLanguages())
+end
+
+-- A "Languages" label + multi-select dropdown below `anchor`; returns the dropdown.
+-- Takes effect with the next search.
+function NS.CreateLanguageDropdown(parentFrame, anchor, xOffset)
+    local label = parentFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", xOffset or 0, -14)
+    label:SetText("Languages")
+
+    local dd = CreateFrame("DropdownButton", nil, parentFrame, "WowStyle1DropdownTemplate")
+    dd:SetWidth(270)
+    dd:SetPoint("TOPLEFT", label, "BOTTOMLEFT", 0, -6)
+
+    local function UpdateText()
+        local offered, hidden, locked = OfferedLanguages(), HiddenLanguages(), LockedLanguages()
+        local shown = 0
+        for _, code in ipairs(offered) do
+            if locked[code] or not hidden[code] then shown = shown + 1 end
+        end
+        if #offered == 0 or shown == #offered then
+            dd:SetDefaultText("All languages")
+        else
+            dd:SetDefaultText(shown .. " of " .. #offered .. " languages")
+        end
+    end
+    UpdateText()
+    dd:HookScript("OnShow", UpdateText)
+    dd.Refresh = UpdateText
+
+    dd:SetupMenu(function(_, root)
+        local hidden, locked = HiddenLanguages(), LockedLanguages()
+        for _, code in ipairs(OfferedLanguages()) do
+            local name = LANGUAGE_NAMES[code] or code
+            if locked[code] then
+                local cb = root:CreateCheckbox(name .. " (your game language)", function() return true end, function() end)
+                if cb.SetEnabled then cb:SetEnabled(false) end
+            else
+                root:CreateCheckbox(name,
+                    function() return not hidden[code] end,
+                    function()
+                        hidden[code] = (not hidden[code]) or nil
+                        UpdateText()
+                    end)
+            end
+        end
+    end)
+    return dd
 end
 
 -- `f` is a filter table with .ids / .levelOnly (the groups tab's or the players tab's).
@@ -1005,7 +1493,7 @@ local function Refresh(f)
     search.token = token
     Render()
 
-    local ok, err = pcall(C_LFGList.Search, DUNGEON_CATEGORY, 0, 0, nil, false, nil, activities)
+    local ok, err = pcall(C_LFGList.Search, DUNGEON_CATEGORY, 0, 0, LanguageSearchFilter(), false, nil, activities)
     if not ok then
         dprint("Search error:", err)
         search.awaiting = nil
@@ -1028,13 +1516,15 @@ ev:RegisterEvent("LFG_LIST_SEARCH_RESULTS_RECEIVED")
 ev:RegisterEvent("LFG_LIST_SEARCH_FAILED")
 ev:RegisterEvent("LFG_LIST_SEARCH_RESULT_UPDATED")
 local renderQueued = false
-ev:SetScript("OnEvent", function(_, event)
-    -- A listing changed (e.g. was delisted): redraw once, coalescing bursts of updates.
+ev:SetScript("OnEvent", function(_, event, resultID)
+    -- A listing changed: re-read it, then redraw once (bursts of updates are coalesced).
     if event == "LFG_LIST_SEARCH_RESULT_UPDATED" then
+        if search.running then return end
+        if type(resultID) == "number" then UpdateEntry(resultID) end
         local function AnyShown()
             return (panel and panel:IsShown()) or (NS.playersPanel and NS.playersPanel:IsShown())
         end
-        if not renderQueued and AnyShown() and not search.running then
+        if not renderQueued and AnyShown() then
             renderQueued = true
             C_Timer.After(0.2, function()
                 renderQueued = false
@@ -1104,11 +1594,12 @@ local function BuildFilterWindow()
     filterWin:SetPoint("TOPLEFT", parent, "TOPRIGHT", 48, 0)
     filterWin:SetPoint("BOTTOMLEFT", parent, "BOTTOMRIGHT", 48, 0)
     filterWin:EnableMouse(true)
-    pcall(filterWin.SetTitle, filterWin, "Filters")
+    pcall(filterWin.SetTitle, filterWin, "Group Filters")
     -- Same dark inset as the main window's list area (created first so it sits behind the controls).
     local fInset = CreateFrame("Frame", nil, filterWin, "InsetFrameTemplate")
     fInset:SetPoint("TOPLEFT", filterWin, "TOPLEFT", 8, -28)
     fInset:SetPoint("BOTTOMRIGHT", filterWin, "BOTTOMRIGHT", -6, 8)
+    filterWin.fInset = fInset
 
     -- Dungeon dropdown (multi-select)
     local dungeonLabel = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -1196,7 +1687,8 @@ local function BuildFilterWindow()
 
     -- Role / member ranges
     local roleHeader = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-    roleHeader:SetPoint("TOPLEFT", psDropdown, "BOTTOMLEFT", 0, -22)
+    local langDropdown = NS.CreateLanguageDropdown(filterWin, psDropdown)
+    roleHeader:SetPoint("TOPLEFT", langDropdown, "BOTTOMLEFT", 0, -22)
     roleHeader:SetText("Find groups by role")
 
     -- One row per range: [x] [icon] Label ....... [from] to [to]
@@ -1306,7 +1798,7 @@ local function BuildFilterWindow()
         Refresh()
     end)
 
-    -- Resets every filter except the dungeon selection.
+    -- Resets every filter to its default, including dungeons and languages.
     local resetBtn = CreateFrame("Button", nil, filterWin, "UIPanelButtonTemplate")
     resetBtn:SetSize(100, 24)
     resetBtn:SetPoint("BOTTOMLEFT", 16, 14)
@@ -1317,6 +1809,15 @@ local function BuildFilterWindow()
         wipe(pending.hiddenPlaystyles)
         wipe(filters.hiddenPlaystyles)
         UpdatePlaystyleText()
+        -- Dungeons: all, only for my level (the default).
+        wipe(pending.names)
+        filters.ids = nil
+        pending.levelOnly, filters.levelOnly = true, true
+        levelCheck:SetChecked(true)
+        UpdateDropdownText()
+        -- Languages: all (shared with the players tab).
+        NS.ResetLanguages()
+        langDropdown.Refresh()
         for _, ui in pairs(rowsUI) do
             ui.cb:SetChecked(false)
             ui.from:SetText("")
@@ -1507,6 +2008,7 @@ local function BuildPanel()
         -- Only one of our tabs at a time.
         if NS.playersPanel then NS.playersPanel:Hide() end
         NS.RaiseAbove(panel)
+        NS.FixFilterBorder(filterWin)
         tab:SetChecked(true)
         Refresh()
     end)
@@ -1520,6 +2022,15 @@ end
 local STRATA = { "BACKGROUND", "LOW", "MEDIUM", "HIGH", "DIALOG", "FULLSCREEN", "FULLSCREEN_DIALOG", "TOOLTIP" }
 local STRATA_RANK = {}
 for i, name in ipairs(STRATA) do STRATA_RANK[name] = i end
+-- The filter window's border (NineSlice) must stay above its dark inset, otherwise the
+-- inset covers the inner half of the border and it looks thin. Re-applied on every
+-- show, because raising the panel shifts the children's frame levels.
+function NS.FixFilterBorder(win)
+    if win and win.NineSlice and win.fInset then
+        win.NineSlice:SetFrameLevel(win.fInset:GetFrameLevel() + 1)
+    end
+end
+
 function NS.RaiseAbove(frame)
     local function Highest(f, depth, best)
         for _, child in ipairs({ f:GetChildren() }) do
