@@ -4,7 +4,7 @@
 ## Author: flori
 ## Version: @project-version@
 ## SavedVariables: BetterLFGDB
-## X-Curse-Project-ID: 000000
+## X-Curse-Project-ID: 1792452
 
 BetterLFG.lua
 Players.lua
