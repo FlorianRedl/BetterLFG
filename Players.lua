@@ -13,13 +13,14 @@ local INVITE_ATLAS = "common-button-list-plus"
 local MAX_LEVEL_DIGITS = 2
 
 local parent, tab, panel, status, countText, scroll, content, filterWin
+local spinner
 local rows = {}
 local sortDesc = true   -- sorted by level, highest first
 
 -- `pending` = what the filter window shows; `filters` = what the list uses (Search copies).
+-- Only the players-only filters live here (roles, level, classes).
 local function NewState()
     return {
-        names = {}, ids = nil, levelOnly = true,
         roles = { tank = false, healer = false, dps = false },
         minLevel = nil, maxLevel = nil,
         minMyLevel = false,   -- "Min my level": minimum = the searching player's own level
@@ -27,6 +28,12 @@ local function NewState()
     }
 end
 local pending, filters = NewState(), NewState()
+
+-- Dungeon selection, "only my level" and playstyles are SHARED with Find Groups:
+-- both tabs read and write the groups tab's state (languages are shared as well).
+--   SP = shared pending (what the filter windows show)
+--   SF = shared filters  (what the lists use, set by Search in either tab)
+local SP, SF = NS.groupPending, NS.groupFilters
 
 local function CopySet(set)
     local c = {}
@@ -46,6 +53,7 @@ local function SaveFilters()
         minMyLevel = filters.minMyLevel,
         hiddenClasses = CopySet(filters.hiddenClasses),
     }
+    NS.SaveGroupFilters()   -- the shared playstyles are saved with the groups tab's filters
 end
 
 function NS.LoadPlayerFilters()
@@ -76,11 +84,11 @@ local function IsDelisted(e)
 end
 
 local function MatchesActivity(e)
-    if filters.ids or filters.levelOnly then
+    if SF.ids or SF.levelOnly then
         local ok = false
         for _, id in ipairs(e.activityIDs) do
-            if filters.ids then
-                if filters.ids[id] then ok = true break end
+            if SF.ids then
+                if SF.ids[id] then ok = true break end
             elseif NS.IsInMyLevelRange(id) then
                 ok = true break
             end
@@ -108,6 +116,9 @@ local function Matches(e)
         if filters.maxLevel and e.soloLevel > filters.maxLevel then return false end
     end
     if e.soloClass and filters.hiddenClasses[e.soloClass] then return false end
+    -- Listings without a (readable) playstyle are always kept.
+    local psKey = e.playstyleValue and NS.PLAYSTYLE_KEY[e.playstyleValue]
+    if psKey and SF.hiddenPlaystyles[psKey] then return false end
     return true
 end
 
@@ -166,9 +177,10 @@ local function GetRow(i)
 
     r.name = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     r.name:SetPoint("LEFT", r.class, "RIGHT", 4, 0)
-    r.name:SetWidth(150)
+    r.name:SetWidth(118)   -- room for the "B-LFG" tag after the name
     r.name:SetJustifyH("LEFT")
     r.name:SetWordWrap(false)
+    r.blfg = NS.CreateUserIcon(r, r.name)
 
     r.level = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     r.level:SetPoint("LEFT", r.name, "RIGHT", 4, 0)
@@ -268,6 +280,7 @@ local function Render()
         else
             r.name:SetTextColor(1, 0.82, 0)
         end
+        NS.UpdateUserIcon(r.blfg, e.leader)
         r.level:SetText(e.soloLevel and ("Lvl " .. e.soloLevel) or "")
         r.playstyle:SetText(delisted and "|cffcc6666Delisted|r" or (e.playstyle or ""))
 
@@ -299,10 +312,10 @@ local function Render()
 
     local running = NS.search.running
     countText:SetText(running and "" or (#list == 1 and "1 player" or (#list .. " players")))
-    if #list > 0 then
+    -- Spinner while searching, else an empty-state message.
+    if spinner then spinner:SetShown(running and #list == 0) end
+    if #list > 0 or running then
         status:SetText("")
-    elseif running then
-        status:SetText("Searching...")
     else
         status:SetText("No players match your filters.")
     end
@@ -315,17 +328,18 @@ end
 -- Filter window
 ---------------------------------------------------------------------------
 local function ApplyFilters()
-    filters.levelOnly = pending.levelOnly
+    SF.levelOnly = SP.levelOnly
     filters.roles = CopySet(pending.roles)
     filters.minLevel, filters.maxLevel = pending.minLevel, pending.maxLevel
     filters.minMyLevel = pending.minMyLevel
     filters.hiddenClasses = CopySet(pending.hiddenClasses)
-    filters.ids = nil
-    if next(pending.names) then
-        filters.ids = {}
+    SF.hiddenPlaystyles = CopySet(SP.hiddenPlaystyles)
+    SF.ids = nil
+    if next(SP.names) then
+        SF.ids = {}
         for _, c in ipairs(NS.ActivityChoices(false)) do
-            if pending.names[c.name] then
-                for _, id in ipairs(c.ids) do filters.ids[id] = true end
+            if SP.names[c.name] then
+                for _, id in ipairs(c.ids) do SF.ids[id] = true end
             end
         end
     end
@@ -362,7 +376,7 @@ local function BuildFilterWindow()
     dropdown:SetPoint("TOPLEFT", dungeonLabel, "BOTTOMLEFT", 0, -6)
     local function UpdateDungeonText()
         local n, first = 0, nil
-        for name in pairs(pending.names) do n = n + 1; first = first or name end
+        for name in pairs(SP.names) do n = n + 1; first = first or name end
         local text = (n == 0 and "All dungeons") or (n == 1 and first) or (n .. " dungeons selected")
         dropdown:SetDefaultText(text)
         return text
@@ -372,15 +386,15 @@ local function BuildFilterWindow()
     dropdown:SetupMenu(function(_, root)
         pcall(root.SetScrollMode, root, 320)
         root:CreateButton("Clear selection", function()
-            wipe(pending.names)
+            wipe(SP.names)
             UpdateDungeonText()
             dropdown:GenerateMenu()
         end)
-        for _, c in ipairs(NS.ActivityChoices(pending.levelOnly)) do
+        for _, c in ipairs(NS.ActivityChoices(SP.levelOnly)) do
             root:CreateCheckbox(c.text,
-                function() return pending.names[c.name] == true end,
+                function() return SP.names[c.name] == true end,
                 function()
-                    pending.names[c.name] = (not pending.names[c.name]) or nil
+                    SP.names[c.name] = (not SP.names[c.name]) or nil
                     UpdateDungeonText()
                 end)
         end
@@ -389,11 +403,45 @@ local function BuildFilterWindow()
     local levelCheck = CreateFrame("CheckButton", nil, filterWin, "UICheckButtonTemplate")
     levelCheck:SetPoint("TOPLEFT", dropdown, "BOTTOMLEFT", -4, -2)
     levelCheck.Text:SetText("Only dungeons for my level")
-    levelCheck:SetChecked(pending.levelOnly)
-    levelCheck:SetScript("OnClick", function(self) pending.levelOnly = self:GetChecked() and true or false end)
+    levelCheck:SetChecked(SP.levelOnly)
+    levelCheck:SetScript("OnClick", function(self) SP.levelOnly = self:GetChecked() and true or false end)
 
     -- Languages (shared with the groups tab; applied on the next search)
-    local langDropdown = NS.CreateLanguageDropdown(filterWin, levelCheck, 4)
+    -- Playstyle (multi-select; all ticked = no filter, untick to hide a playstyle)
+    local psLabel = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    psLabel:SetPoint("TOPLEFT", levelCheck, "BOTTOMLEFT", 4, -14)
+    psLabel:SetText("Playstyle")
+
+    local psDropdown = CreateFrame("DropdownButton", nil, filterWin, "WowStyle1DropdownTemplate")
+    psDropdown:SetWidth(270)
+    psDropdown:SetPoint("TOPLEFT", psLabel, "BOTTOMLEFT", 0, -6)
+    local function UpdatePlaystyleText()
+        local shown, names = 0, {}
+        for _, p in ipairs(NS.PLAYSTYLES) do
+            if not SP.hiddenPlaystyles[p.key] then
+                shown = shown + 1
+                table.insert(names, p.label)
+            end
+        end
+        local text = (shown == #NS.PLAYSTYLES and "All playstyles") or (shown == 0 and "No playstyle")
+            or table.concat(names, ", ")
+        psDropdown:SetDefaultText(text)
+        return text
+    end
+    UpdatePlaystyleText()
+    NS.UseSummaryText(psDropdown, UpdatePlaystyleText)
+    psDropdown:SetupMenu(function(_, root)
+        for _, p in ipairs(NS.PLAYSTYLES) do
+            root:CreateCheckbox(p.label,
+                function() return not SP.hiddenPlaystyles[p.key] end,
+                function()
+                    SP.hiddenPlaystyles[p.key] = (not SP.hiddenPlaystyles[p.key]) or nil
+                    UpdatePlaystyleText()
+                end)
+        end
+    end)
+
+    local langDropdown = NS.CreateLanguageDropdown(filterWin, psDropdown)
 
     -- Roles: show players who can play any of the ticked roles
     local roleHeader = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -519,7 +567,7 @@ local function BuildFilterWindow()
         ApplyFilters()
         SaveFilters()
         Render()
-        NS.Refresh(filters)
+        NS.Refresh(SF)
     end)
 
     -- Resets every filter to its default, including dungeons and languages.
@@ -534,14 +582,19 @@ local function BuildFilterWindow()
             state.minMyLevel = false
             state.hiddenClasses = {}
         end
+        -- Shared with Find Groups: playstyles back to all.
+        wipe(SP.hiddenPlaystyles)
+        wipe(SF.hiddenPlaystyles)
+        UpdatePlaystyleText()
+        NS.RefreshDropdown(psDropdown)
         for _, cb in pairs(roleChecks) do cb:SetChecked(false) end
         fromBox:SetText(""); toBox:SetText("")
         myLevelCheck:SetChecked(false)
         UpdateMinBox()
         -- Dungeons: all, only for my level (the default).
-        wipe(pending.names)
-        filters.ids = nil
-        pending.levelOnly, filters.levelOnly = true, true
+        wipe(SP.names)
+        SF.ids = nil
+        SP.levelOnly, SF.levelOnly = true, true
         levelCheck:SetChecked(true)
         UpdateDungeonText()
         NS.RefreshDropdown(dropdown)
@@ -552,6 +605,16 @@ local function BuildFilterWindow()
         SaveFilters()
         Render()
     end)
+
+    -- The shared filters may have been changed in Find Groups: show their current state.
+    filterWin.SyncShared = function()
+        UpdateDungeonText()
+        NS.RefreshDropdown(dropdown)
+        levelCheck:SetChecked(SP.levelOnly)
+        UpdatePlaystyleText()
+        NS.RefreshDropdown(psDropdown)
+        langDropdown.Refresh()
+    end
 
     local gear = CreateFrame("Button", nil, filterWin)
     gear:SetSize(24, 24)
@@ -583,6 +646,7 @@ local function BuildPanel()
     end
 
     local close = CreateFrame("Button", nil, panel, "UIPanelCloseButtonNoScripts")
+    panel.closeBtn = close
     close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function()
         panel:Hide()
@@ -595,6 +659,7 @@ local function BuildPanel()
 
     status = inset:CreateFontString(nil, "OVERLAY", "GameFontDisable")
     status:SetPoint("CENTER", inset, "CENTER", 0, 0)
+    spinner = NS.CreateSpinner(inset)
 
     countText = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     countText:SetPoint("BOTTOMRIGHT", inset, "TOPRIGHT", -6, 6)
@@ -659,11 +724,17 @@ local function BuildPanel()
         if NS.groupsPanel then NS.groupsPanel:Hide() end
         NS.RaiseAbove(panel)
         NS.FixFilterBorder(filterWin)
+        NS.FixCloseButton(panel)
+        NS.SuppressBlizzardTabs()
+        if filterWin.SyncShared then filterWin.SyncShared() end
         tab:SetChecked(true)
         Render()
-        NS.Refresh(filters)   -- runs inside the tab click, so the search is allowed
+        NS.Refresh(SF)   -- runs inside the tab click, so the search is allowed
     end)
-    panel:SetScript("OnHide", function() tab:SetChecked(false) end)
+    panel:SetScript("OnHide", function()
+        tab:SetChecked(false)
+        NS.RestoreBlizzardTabs()
+    end)
     parent:HookScript("OnHide", function() panel:Hide() end)
 end
 
@@ -691,7 +762,7 @@ function NS.BuildPlayers()
     -- Blizzard's own side tabs bring their panel back.
     for _, child in ipairs({ parent:GetChildren() }) do
         if child ~= tab and child ~= NS.groupsTab and child.Icon and child.SetCustomOnMouseUpHandler then
-            child:HookScript("OnMouseUp", function() panel:Hide() end)
+            child:HookScript("OnMouseUp", function() NS.OnBlizzardTabClick() end)
         end
     end
 end

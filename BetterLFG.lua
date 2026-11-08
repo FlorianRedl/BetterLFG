@@ -25,6 +25,7 @@ local SEARCH_TIMEOUT = 15
 local MAX_MEMBERS_SCANNED = 40
 
 local parent, tab, panel, status, countText, soloText, soloClassText, scroll, content, filterWin
+local spinner
 local soloClassCounts = {}
 -- Forward declarations (defined further down).
 local Render, WhisperLeader, ShowRowMenu, BuildSettings, OpenSettings
@@ -271,6 +272,59 @@ end
 local function ShortName(name)
     name = name:gsub("|c%x%x%x%x%x%x%x%x", ""):gsub("|r", "")
     return Ambiguate and Ambiguate(name, "short") or (name:match("^[^-]+") or name)
+end
+
+-- Players known to use Better LFG: anyone who sent us one of our addon messages.
+-- Saved with the time they were last seen, kept for 14 days.
+local KNOWN_USER_DAYS = 14
+local function KnownUsers()
+    BetterLFGDB = BetterLFGDB or {}
+    if type(BetterLFGDB.knownUsers) ~= "table" then BetterLFGDB.knownUsers = {} end
+    return BetterLFGDB.knownUsers
+end
+
+-- Returns true when the player was not known before.
+local function MarkUser(name)
+    if not name or name == "" then return false end
+    local users = KnownUsers()
+    local isNew = users[name] == nil
+    users[name] = time()
+    return isNew
+end
+
+function NS.IsBLFGUser(name)
+    if not name or name == "" or name == "(hidden)" then return false end
+    name = ShortName(name)
+    if name == UnitName("player") then return true end
+    return KnownUsers()[name] ~= nil
+end
+
+local function PruneKnownUsers()
+    local users, limit = KnownUsers(), time() - KNOWN_USER_DAYS * 86400
+    for name, seen in pairs(users) do
+        if type(seen) ~= "number" or seen < limit then users[name] = nil end
+    end
+end
+
+-- Small dark-blue "B-LFG" tag right after a name text (hidden when not a known user).
+function NS.CreateUserIcon(row, nameText)
+    local tag = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    tag:SetText("B-LFG")
+    tag:SetTextColor(0.25, 0.45, 0.85)
+    tag:Hide()
+    tag.nameText = nameText
+    return tag
+end
+
+function NS.UpdateUserIcon(icon, name)
+    if NS.IsBLFGUser(name) then
+        local w = math.min(icon.nameText:GetStringWidth(), icon.nameText:GetWidth())
+        icon:ClearAllPoints()
+        icon:SetPoint("LEFT", icon.nameText, "LEFT", w + 3, 0)
+        icon:Show()
+    else
+        icon:Hide()
+    end
 end
 
 -- Equipment slots that count toward the item level (no shirt, no tabard), in display order.
@@ -806,10 +860,25 @@ function BuildSettings()
     flashHint:SetJustifyH("LEFT")
     flashHint:SetText("A row flashes green for a moment when its group or player changes - e.g. someone joined, a role was filled, or it was delisted.")
 
+    -- Open our tab when the Group Finder opens (on by default).
+    local openCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    openCheck:SetPoint("TOPLEFT", flashHint, "BOTTOMLEFT", -30, -16)
+    openCheck.Text:SetText("Open Find Groups by default")
+    openCheck:SetScript("OnClick", function(self)
+        BetterLFGDB = BetterLFGDB or {}
+        BetterLFGDB.openByDefault = self:GetChecked() and true or false
+    end)
+    local openHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    openHint:SetPoint("TOPLEFT", openCheck, "BOTTOMLEFT", 30, -2)
+    openHint:SetWidth(560)
+    openHint:SetJustifyH("LEFT")
+    openHint:SetText("Opening the Group Finder (key I or the micro menu) shows the Find Groups tab instead of Blizzard's tab.")
+
     f:SetScript("OnShow", function()
         edit:SetText(GetWhisperText())
         unitCheck:SetChecked(BetterLFGDB and BetterLFGDB.unitTooltipIlvl == true)
         flashCheck:SetChecked(not (BetterLFGDB and BetterLFGDB.flashUpdates == false))
+        openCheck:SetChecked(not (BetterLFGDB and BetterLFGDB.openByDefault == false))
     end)
 
     settingsCategory = Settings.RegisterCanvasLayoutCategory(f, "Better LFG")
@@ -831,6 +900,11 @@ comm:SetScript("OnEvent", function(_, _, prefix, message, channel, sender)
     if prefix ~= PREFIX or not sender then return end
     if not canaccessvalue(sender) or not canaccessvalue(message) then return end
     local who = ShortName(sender)
+    -- Whoever sends us one of our messages uses Better LFG: mark them (and redraw the
+    -- lists once, so the icon appears next to their name).
+    if MarkUser(who) and Render and ((panel and panel:IsShown()) or (NS.playersPanel and NS.playersPanel:IsShown())) then
+        Render()
+    end
     if message == "REQ" then
         local il = MyItemLevel()
         if il then pcall(C_ChatInfo.SendAddonMessage, PREFIX, "ILVL:" .. il, "WHISPER", sender) end
@@ -978,6 +1052,25 @@ end
 ---------------------------------------------------------------------------
 -- Rendering
 ---------------------------------------------------------------------------
+-- Loading spinner in the middle of a list while a search runs: Blizzard's own
+-- LoadingSpinnerTemplate (the one its Browse tab uses; it animates by itself while
+-- shown), with a small "Searching..." label below. Falls back to the label alone.
+function NS.CreateSpinner(inset)
+    local holder = CreateFrame("Frame", nil, inset)
+    holder:SetSize(60, 60)
+    holder:SetPoint("CENTER", inset, "CENTER", 0, 10)
+    holder:SetFrameLevel(inset:GetFrameLevel() + 10)
+    local ok, spinner = pcall(CreateFrame, "Frame", nil, holder, "LoadingSpinnerTemplate")
+    if ok and spinner then
+        spinner:SetPoint("CENTER")
+    end
+    local label = holder:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    label:SetPoint("TOP", holder, "BOTTOM", 0, -2)
+    label:SetText("Searching...")
+    holder:Hide()
+    return holder
+end
+
 -- A short green flash over a row (used when a listing was updated live).
 function NS.FlashRow(row)
     -- Option "Highlight live updates" (on by default).
@@ -1024,9 +1117,10 @@ local function GetRow(i)
     -- Line 1: leader | average level | playstyle
     r.leader = r:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     r.leader:SetPoint("TOPLEFT", 8, -6)
-    r.leader:SetWidth(150)
+    r.leader:SetWidth(118)   -- room for the "B-LFG" tag after the name
     r.leader:SetJustifyH("LEFT")
     r.leader:SetWordWrap(false)
+    r.blfg = NS.CreateUserIcon(r, r.leader)
 
     r.level = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
     r.level:SetPoint("LEFT", r.leader, "RIGHT", 4, 0)
@@ -1169,6 +1263,7 @@ function Render()
             else
                 r.leader:SetTextColor(1, 0.82, 0)
             end
+            NS.UpdateUserIcon(r.blfg, e.leader)
             r.level:SetText(e.avgLevel and ("Ø " .. e.avgLevel) or "")
             r.playstyle:SetText(e.playstyle)
             -- Delisted since the search: keep the row, but faded and marked.
@@ -1225,11 +1320,10 @@ function Render()
                 ROLE_MARKUP.DAMAGER, solo.DAMAGER)
         end
     end
-    -- Empty-state message in the middle of the list.
-    if shown > 0 then
+    -- Spinner while searching, else an empty-state message in the middle of the list.
+    if spinner then spinner:SetShown(search.running and shown == 0) end
+    if shown > 0 or search.running then
         status:SetText("")
-    elseif search.running then
-        status:SetText("Searching...")
     elseif #results == 0 then
         status:SetText("No open groups found.")
     else
@@ -1841,6 +1935,16 @@ local function BuildFilterWindow()
         Render()
     end)
 
+    -- The shared filters may have been changed in Find Players: show their current state.
+    filterWin.SyncShared = function()
+        UpdateDropdownText()
+        NS.RefreshDropdown(dropdown)
+        levelCheck:SetChecked(pending.levelOnly)
+        UpdatePlaystyleText()
+        NS.RefreshDropdown(psDropdown)
+        langDropdown.Refresh()
+    end
+
     local gear = CreateFrame("Button", nil, filterWin)
     gear:SetSize(24, 24)
     gear:SetPoint("LEFT", resetBtn, "RIGHT", 6, 0)
@@ -1880,6 +1984,7 @@ local function BuildPanel()
     end
 
     local close = CreateFrame("Button", nil, panel, "UIPanelCloseButtonNoScripts")
+    panel.closeBtn = close
     close:SetPoint("TOPRIGHT", panel, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function()
         panel:Hide()
@@ -1892,6 +1997,7 @@ local function BuildPanel()
 
     status = inset:CreateFontString(nil, "OVERLAY", "GameFontDisable")
     status:SetPoint("CENTER", inset, "CENTER", 0, 0)
+    spinner = NS.CreateSpinner(inset)
 
     -- Column headers, aligned with the row columns. "Ø Level" and "Members" sort on click
     -- (first click: highest first, second click: lowest first).
@@ -2023,10 +2129,16 @@ local function BuildPanel()
         if NS.playersPanel then NS.playersPanel:Hide() end
         NS.RaiseAbove(panel)
         NS.FixFilterBorder(filterWin)
+        NS.FixCloseButton(panel)
+        NS.SuppressBlizzardTabs()
+        if filterWin.SyncShared then filterWin.SyncShared() end
         tab:SetChecked(true)
         Refresh()
     end)
-    panel:SetScript("OnHide", function() tab:SetChecked(false) end)
+    panel:SetScript("OnHide", function()
+        tab:SetChecked(false)
+        NS.RestoreBlizzardTabs()
+    end)
     parent:HookScript("OnHide", ClosePanel)
 end
 
@@ -2043,6 +2155,71 @@ function NS.FixFilterBorder(win)
     if win and win.NineSlice and win.fInset then
         win.NineSlice:SetFrameLevel(win.fInset:GetFrameLevel() + 1)
     end
+end
+
+-- Our panels' close button: same size and spot as the Group Finder's own close button
+-- (which our panel covers), and above the panel's border so the border can't hide it.
+function NS.FixCloseButton(p)
+    local c = p and p.closeBtn
+    if not c then return end
+    -- Blizzard's default close-button spot for its portrait frames
+    -- (UIPanelCloseButtonDefaultAnchors): top right corner, x = 1, y = 0, 24x24.
+    c:ClearAllPoints()
+    c:SetPoint("TOPRIGHT", p, "TOPRIGHT", 1, 0)
+    c:SetSize(24, 24)
+    c:SetFrameStrata(p:GetFrameStrata())
+    -- Above every other layer of the window (border, portrait, title bar have their own,
+    -- partly fixed, frame levels in Blizzard's template) - otherwise the X is there and
+    -- clickable, but drawn underneath and invisible.
+    local top = p:GetFrameLevel()
+    for _, child in ipairs({ p:GetChildren() }) do
+        if child ~= c and child:GetFrameLevel() > top then top = child:GetFrameLevel() end
+    end
+    c:SetFrameLevel(top + 5)
+    c:Show()
+end
+
+-- Blizzard's own side tab stays "selected" while one of our panels covers its panel.
+-- Purely visual fix: while ours is open, their selected tab is shown unselected, and
+-- the previous state comes back when ours closes. Their selectedTab field and panels
+-- are never touched.
+local suppressedTabs = {}
+local function IsOurTab(t)
+    return t == tab or t == NS.playersTab or t == _G.LFGForeverBlizzardTab
+end
+
+-- Blizzard's side tabs are frames, not check buttons: there is no GetChecked, the
+-- selection is their SelectedTexture being shown (which SetChecked toggles).
+local function IsTabSelected(t)
+    if t.GetChecked then return t:GetChecked() end
+    if t.SelectedTexture then return t.SelectedTexture:IsShown() end
+    return false
+end
+
+function NS.SuppressBlizzardTabs()
+    for _, child in ipairs({ parent:GetChildren() }) do
+        if not IsOurTab(child) and child.Icon and child.SetChecked and IsTabSelected(child) then
+            child:SetChecked(false)
+            suppressedTabs[child] = true
+        end
+    end
+end
+
+-- Called when one of our panels closes. Not while the other one of ours is open.
+function NS.RestoreBlizzardTabs()
+    if (NS.groupsPanel and NS.groupsPanel:IsShown()) or (NS.playersPanel and NS.playersPanel:IsShown()) then
+        return
+    end
+    for t in pairs(suppressedTabs) do t:SetChecked(true) end
+    wipe(suppressedTabs)
+end
+
+-- A Blizzard tab was clicked: their code has already set the right tab as selected,
+-- so forget the old state instead of restoring it, then close our panels.
+function NS.OnBlizzardTabClick()
+    wipe(suppressedTabs)
+    if NS.groupsPanel then NS.groupsPanel:Hide() end
+    if NS.playersPanel then NS.playersPanel:Hide() end
 end
 
 function NS.RaiseAbove(frame)
@@ -2095,7 +2272,7 @@ end
 local function HookBlizzardTabs()
     for _, child in ipairs({ parent:GetChildren() }) do
         if child ~= tab and child.Icon and child.SetCustomOnMouseUpHandler then
-            child:HookScript("OnMouseUp", function() ClosePanel() end)
+            child:HookScript("OnMouseUp", function() NS.OnBlizzardTabClick() end)
         end
     end
 end
@@ -2117,11 +2294,19 @@ NS.ROLE_COORDS = ROLE_COORDS
 NS.ClassMarkup = ClassMarkup
 NS.ClassOrder = ClassOrder
 NS.ClassName = ClassName
+NS.PLAYSTYLES = PLAYSTYLES
+NS.PLAYSTYLE_KEY = PLAYSTYLE_KEY
+-- Dungeons, "only my level" and playstyles are shared with Find Players: it reads and
+-- writes these same tables (never replace the tables themselves, only their fields).
+NS.groupPending = pending
+NS.groupFilters = filters
+NS.SaveGroupFilters = SaveRoles
 
 -- Wait for our own saved variables first, then for the Group Finder.
 EventUtil.ContinueOnAddOnLoaded(ADDON, function()
     BetterLFGDB = BetterLFGDB or {}
     LoadRoles()
+    PruneKnownUsers()
     BuildSettings()
     if NS.LoadPlayerFilters then NS.LoadPlayerFilters() end
     EventUtil.ContinueOnAddOnLoaded("Blizzard_GroupFinder_VanillaStyle", function()
@@ -2132,6 +2317,34 @@ EventUtil.ContinueOnAddOnLoaded(ADDON, function()
         HookBlizzardTabs()
         NS.parent, NS.groupsPanel, NS.groupsTab = parent, panel, tab
         if NS.BuildPlayers then NS.BuildPlayers() end
+        -- Workaround for a Blizzard quirk: on the first open per session the panel manager
+        -- places the Group Finder next to the Character window before that window has its
+        -- final width (stats pane), so the two overlap. Re-run Blizzard's own positioning
+        -- one frame later, and whenever the Character window changes width. Out of combat
+        -- only (the panel manager is protected in combat).
+        local function Reposition()
+            if InCombatLockdown() or not UpdateUIPanelPositions then return end
+            if parent:IsShown() and CharacterFrame and CharacterFrame:IsShown() then
+                pcall(UpdateUIPanelPositions, CharacterFrame)
+            end
+        end
+        if CharacterFrame then
+            CharacterFrame:HookScript("OnShow", function() C_Timer.After(0, Reposition) end)
+            CharacterFrame:HookScript("OnSizeChanged", function() C_Timer.After(0, Reposition) end)
+        end
+
+        -- Option "Open Find Groups by default" (on): opening the Group Finder (key I,
+        -- micro menu) shows our tab. This runs inside that key press / click, so the
+        -- search the panel starts is allowed.
+        parent:HookScript("OnShow", function()
+            if BetterLFGDB and BetterLFGDB.openByDefault == false then return end
+            if not panel:IsShown() then panel:Show() end
+            -- Blizzard selects its tab only after this hook, so un-highlight it once
+            -- more on the next frame.
+            C_Timer.After(0, function()
+                if panel:IsShown() then NS.SuppressBlizzardTabs() end
+            end)
+        end)
     end)
 end)
 
