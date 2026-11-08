@@ -1409,6 +1409,19 @@ local function LanguageSearchFilter()
     return any and filter or nil
 end
 
+-- Blizzard's dropdown shows the ticked entries as its text ("Learning, Relaxed, ...").
+-- This replaces that with our own summary ("All playstyles", "2 of 4 languages", ...).
+function NS.UseSummaryText(dd, compute)
+    if dd.SetSelectionText then
+        dd:SetSelectionText(function() return compute() end)
+    end
+end
+
+-- Rebuilds a dropdown so its text matches the current state (after a reset).
+function NS.RefreshDropdown(dd)
+    if dd and dd.GenerateMenu then pcall(dd.GenerateMenu, dd) end
+end
+
 -- Back to the default: every offered language ticked.
 function NS.ResetLanguages()
     wipe(HiddenLanguages())
@@ -1431,15 +1444,19 @@ function NS.CreateLanguageDropdown(parentFrame, anchor, xOffset)
         for _, code in ipairs(offered) do
             if locked[code] or not hidden[code] then shown = shown + 1 end
         end
-        if #offered == 0 or shown == #offered then
-            dd:SetDefaultText("All languages")
-        else
-            dd:SetDefaultText(shown .. " of " .. #offered .. " languages")
-        end
+        local text = (#offered == 0 or shown == #offered) and "All languages"
+            or (shown .. " of " .. #offered .. " languages")
+        dd:SetDefaultText(text)
+        return text
     end
     UpdateText()
-    dd:HookScript("OnShow", UpdateText)
-    dd.Refresh = UpdateText
+    NS.UseSummaryText(dd, UpdateText)
+    dd.Refresh = function()
+        UpdateText()
+        NS.RefreshDropdown(dd)
+    end
+    -- Shared with the other tab: catch up with changes made there.
+    dd:HookScript("OnShow", function() dd.Refresh() end)
 
     dd:SetupMenu(function(_, root)
         local hidden, locked = HiddenLanguages(), LockedLanguages()
@@ -1612,15 +1629,12 @@ local function BuildFilterWindow()
 
     local function UpdateDropdownText()
         local n = SelectedCount()
-        if n == 0 then
-            dropdown:SetDefaultText("All dungeons")
-        elseif n == 1 then
-            dropdown:SetDefaultText(next(pending.names))
-        else
-            dropdown:SetDefaultText(n .. " dungeons selected")
-        end
+        local text = (n == 0 and "All dungeons") or (n == 1 and next(pending.names)) or (n .. " dungeons selected")
+        dropdown:SetDefaultText(text)
+        return text
     end
     UpdateDropdownText()
+    NS.UseSummaryText(dropdown, UpdateDropdownText)
 
     dropdown:SetupMenu(function(_, root)
         pcall(root.SetScrollMode, root, 320)
@@ -1664,15 +1678,13 @@ local function BuildFilterWindow()
                 table.insert(names, p.label)
             end
         end
-        if shown == #PLAYSTYLES then
-            psDropdown:SetDefaultText("All playstyles")
-        elseif shown == 0 then
-            psDropdown:SetDefaultText("No playstyle")
-        else
-            psDropdown:SetDefaultText(table.concat(names, ", "))
-        end
+        local text = (shown == #PLAYSTYLES and "All playstyles") or (shown == 0 and "No playstyle")
+            or table.concat(names, ", ")
+        psDropdown:SetDefaultText(text)
+        return text
     end
     UpdatePlaystyleText()
+    NS.UseSummaryText(psDropdown, UpdatePlaystyleText)
 
     psDropdown:SetupMenu(function(_, root)
         for _, p in ipairs(PLAYSTYLES) do
@@ -1815,6 +1827,8 @@ local function BuildFilterWindow()
         pending.levelOnly, filters.levelOnly = true, true
         levelCheck:SetChecked(true)
         UpdateDropdownText()
+        NS.RefreshDropdown(dropdown)
+        NS.RefreshDropdown(psDropdown)
         -- Languages: all (shared with the players tab).
         NS.ResetLanguages()
         langDropdown.Refresh()

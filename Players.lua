@@ -363,15 +363,12 @@ local function BuildFilterWindow()
     local function UpdateDungeonText()
         local n, first = 0, nil
         for name in pairs(pending.names) do n = n + 1; first = first or name end
-        if n == 0 then
-            dropdown:SetDefaultText("All dungeons")
-        elseif n == 1 then
-            dropdown:SetDefaultText(first)
-        else
-            dropdown:SetDefaultText(n .. " dungeons selected")
-        end
+        local text = (n == 0 and "All dungeons") or (n == 1 and first) or (n .. " dungeons selected")
+        dropdown:SetDefaultText(text)
+        return text
     end
     UpdateDungeonText()
+    NS.UseSummaryText(dropdown, UpdateDungeonText)
     dropdown:SetupMenu(function(_, root)
         pcall(root.SetScrollMode, root, 320)
         root:CreateButton("Clear selection", function()
@@ -547,6 +544,7 @@ local function BuildFilterWindow()
         pending.levelOnly, filters.levelOnly = true, true
         levelCheck:SetChecked(true)
         UpdateDungeonText()
+        NS.RefreshDropdown(dropdown)
         -- Languages: all (shared with the groups tab).
         NS.ResetLanguages()
         langDropdown.Refresh()
