@@ -34,12 +34,24 @@ local results = {}
 local search = { queue = {}, running = false, token = 0 }
 
 -- Filter state
--- Each range: on = checkbox, min/max = nil when the box is empty.
-local RANGE_KEYS = { "members", "tank", "healer", "damage" }
+-- "Find groups by role": five checkboxes (all off = no constraint), ANDed together.
+--   tankAvailable / healerAvailable / damageAvailable: the group is SHORT of that role
+--   hasTank / hasHealer:                                the group already has it
+-- `enough` is a full dungeon party: 1 tank, 1 healer, 3 damage dealers.
+local ROLE_CRITERIA = {
+    { field = "tankAvailable",   counts = "TANK",    enough = 1, covered = false },
+    { field = "healerAvailable", counts = "HEALER",  enough = 1, covered = false },
+    { field = "damageAvailable", counts = "DAMAGER", enough = 3, covered = false },
+    { field = "hasTank",         counts = "TANK",    enough = 1, covered = true },
+    { field = "hasHealer",       counts = "HEALER",  enough = 1, covered = true },
+}
 -- `pending` is what the filter window shows; `filters` is what the list uses.
 -- The Search button copies pending -> filters.
+-- hiddenGroupClasses: "No groups with..." - hide groups that contain one of these classes.
 local function ResetRanges(state)
-    for _, k in ipairs(RANGE_KEYS) do state[k] = { on = false, min = nil, max = nil } end
+    state.roles = {}
+    for _, c in ipairs(ROLE_CRITERIA) do state.roles[c.field] = false end
+    state.hiddenGroupClasses = {}
 end
 -- hiddenPlaystyles: set of playstyle keys the player unticked (empty = show all).
 local pending = { levelOnly = true, names = {}, hiddenPlaystyles = {} }   -- names: selected dungeon names
@@ -69,12 +81,9 @@ end
 -- and the unticked playstyles.
 local function SaveRoles()
     BetterLFGDB = BetterLFGDB or {}
-    local saved = {}
-    for _, k in ipairs(RANGE_KEYS) do
-        local f = filters[k]
-        saved[k] = { on = f.on, min = f.min, max = f.max }
-    end
-    BetterLFGDB.roles = saved
+    BetterLFGDB.groupRoles = CopySet(filters.roles)
+    BetterLFGDB.hiddenGroupClasses = CopySet(filters.hiddenGroupClasses)
+    BetterLFGDB.roles = nil   -- the old from/to ranges of version 1.x
     BetterLFGDB.hiddenPlaystyles = CopySet(filters.hiddenPlaystyles)
 end
 
@@ -88,18 +97,20 @@ local function LoadRoles()
             end
         end
     end
-    local saved = BetterLFGDB and BetterLFGDB.roles
-    if type(saved) ~= "table" then return end
-    for _, k in ipairs(RANGE_KEYS) do
-        local s = saved[k]
-        if type(s) == "table" then
-            local r = {
-                on = s.on == true,
-                min = type(s.min) == "number" and s.min or nil,
-                max = type(s.max) == "number" and s.max or nil,
-            }
-            pending[k] = { on = r.on, min = r.min, max = r.max }
-            filters[k] = r
+    local roles = BetterLFGDB and BetterLFGDB.groupRoles
+    if type(roles) == "table" then
+        for _, c in ipairs(ROLE_CRITERIA) do
+            pending.roles[c.field] = roles[c.field] == true
+            filters.roles[c.field] = roles[c.field] == true
+        end
+    end
+    local classes = BetterLFGDB and BetterLFGDB.hiddenGroupClasses
+    if type(classes) == "table" then
+        for k, v in pairs(classes) do
+            if type(k) == "string" and v == true then
+                pending.hiddenGroupClasses[k] = true
+                filters.hiddenGroupClasses[k] = true
+            end
         end
     end
 end
@@ -196,20 +207,6 @@ end
 ---------------------------------------------------------------------------
 -- Filtering
 ---------------------------------------------------------------------------
--- A checked range applies to how many of that role are in the group
--- (empty "from"/"to" = no bound on that side). Unreadable counts never hide a group.
-local ROLE_RULES = {
-    { field = "tank",   key = "TANK" },
-    { field = "healer", key = "HEALER" },
-    { field = "damage", key = "DAMAGER" },
-}
-
-local function InRange(f, value)
-    if value == nil then return true end
-    if f.min and value < f.min then return false end
-    if f.max and value > f.max then return false end
-    return true
-end
 
 -- Dungeon selection / "only my level" (used for groups AND for the solo-player summary).
 local function MatchesActivity(e)
@@ -229,16 +226,23 @@ local function MatchesActivity(e)
 end
 
 local function Matches(e)
-    if filters.members.on and not InRange(filters.members, e.numMembers) then return false end
     -- Listings without a (readable) playstyle are always kept.
     local psKey = e.playstyleValue and PLAYSTYLE_KEY[e.playstyleValue]
     if psKey and filters.hiddenPlaystyles[psKey] then return false end
     if not MatchesActivity(e) then return false end
-    for _, rule in ipairs(ROLE_RULES) do
-        local f = filters[rule.field]
-        if f.on and e.counts then
-            local have = Readable(e.counts[rule.key], nil) or 0
-            if not InRange(f, have) then return false end
+    -- Role checkboxes; a count that cannot be read never hides a group.
+    if e.counts then
+        for _, c in ipairs(ROLE_CRITERIA) do
+            if filters.roles[c.field] then
+                local have = Readable(e.counts[c.counts], nil)
+                if have ~= nil and (have >= c.enough) ~= c.covered then return false end
+            end
+        end
+    end
+    -- "No groups with...": any member of a hidden class hides the group.
+    if e.classes and next(filters.hiddenGroupClasses) then
+        for cls in pairs(e.classes) do
+            if filters.hiddenGroupClasses[cls] then return false end
         end
     end
     return true
@@ -874,11 +878,28 @@ function BuildSettings()
     openHint:SetJustifyH("LEFT")
     openHint:SetText("Opening the Group Finder (key I or the micro menu) shows the Find Groups tab instead of Blizzard's tab.")
 
+    -- "Fewest armor competition" (off by default).
+    local armorCheck = CreateFrame("CheckButton", nil, f, "UICheckButtonTemplate")
+    armorCheck:SetPoint("TOPLEFT", openHint, "BOTTOMLEFT", -30, -16)
+    armorCheck.Text:SetText("Fewest armor competition")
+    armorCheck:SetScript("OnClick", function(self)
+        BetterLFGDB = BetterLFGDB or {}
+        BetterLFGDB.armorFeature = self:GetChecked() and true or false
+        if NS.UpdateArmorVisibility then NS.UpdateArmorVisibility() end
+        if Render then pcall(Render) end
+    end)
+    local armorHint = f:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+    armorHint:SetPoint("TOPLEFT", armorCheck, "BOTTOMLEFT", 30, -2)
+    armorHint:SetWidth(560)
+    armorHint:SetJustifyH("LEFT")
+    armorHint:SetText("Adds a selection to the Group Filters that puts groups with the fewest members wearing your (or a chosen) armor type first - less competition for loot.")
+
     f:SetScript("OnShow", function()
         edit:SetText(GetWhisperText())
         unitCheck:SetChecked(BetterLFGDB and BetterLFGDB.unitTooltipIlvl == true)
         flashCheck:SetChecked(not (BetterLFGDB and BetterLFGDB.flashUpdates == false))
         openCheck:SetChecked(not (BetterLFGDB and BetterLFGDB.openByDefault == false))
+        armorCheck:SetChecked(BetterLFGDB and BetterLFGDB.armorFeature == true)
     end)
 
     settingsCategory = Settings.RegisterCanvasLayoutCategory(f, "Better LFG")
@@ -1189,6 +1210,74 @@ end
 local sortKey, sortDesc = "members", true   -- default: most members first
 local headers = {}
 
+---------------------------------------------------------------------------
+-- Armor types ("Fewest armor competition")
+---------------------------------------------------------------------------
+-- Classic rules: Hunters and Shamans wear leather until 40, then mail;
+-- Warriors and Paladins wear mail until 40, then plate.
+local ARMOR_LEVEL = 40
+local function ArmorType(classFile, level)
+    if classFile == "MAGE" or classFile == "PRIEST" or classFile == "WARLOCK" then return "CLOTH" end
+    if classFile == "ROGUE" or classFile == "DRUID" or classFile == "MONK" or classFile == "DEMONHUNTER" then
+        return "LEATHER"
+    end
+    local high = type(level) == "number" and level >= ARMOR_LEVEL
+    if classFile == "HUNTER" or classFile == "SHAMAN" or classFile == "EVOKER" then
+        return high and "MAIL" or "LEATHER"
+    end
+    if classFile == "WARRIOR" or classFile == "PALADIN" or classFile == "DEATHKNIGHT" then
+        return high and "PLATE" or "MAIL"
+    end
+    return nil
+end
+
+local ARMOR_LABELS = { CLOTH = "Cloth", LEATHER = "Leather", MAIL = "Mail", PLATE = "Plate" }
+
+-- The armor type the list is sorted by (fewest wearers first), or nil when off.
+-- Saved setting: nil/"OFF", "MINE" (own class and level), or one of the types.
+local function MyArmorType()
+    local _, classFile = UnitClass("player")
+    return ArmorType(classFile, UnitLevel("player"))
+end
+
+-- Option "Fewest armor competition" (off by default): only then is the selection shown
+-- in Group Filters and the sort applied.
+local function ArmorFeatureOn()
+    return BetterLFGDB and BetterLFGDB.armorFeature == true
+end
+
+local function ActiveArmorSort()
+    if not ArmorFeatureOn() then return nil end
+    local s = BetterLFGDB and BetterLFGDB.armorSort
+    if s == "MINE" then return MyArmorType() end
+    if ARMOR_LABELS[s] then return s end
+    return nil
+end
+
+-- The classes in a group, as a set ({ MAGE = true, ... }), for "No groups with...".
+local function MemberClasses(id, numMembers)
+    local classes = {}
+    for i = 1, math.min(numMembers or 0, MAX_MEMBERS_SCANNED) do
+        local m = C_LFGList.GetSearchResultPlayerInfo(id, i)
+        local classFile = m and Readable(m.classFilename, nil)
+        if classFile then classes[classFile] = true end
+    end
+    return classes
+end
+
+-- Members of each armor type in a group ({ CLOTH = 1, LEATHER = 2, ... }).
+local function CountArmor(id, numMembers)
+    local counts = { CLOTH = 0, LEATHER = 0, MAIL = 0, PLATE = 0 }
+    for i = 1, math.min(numMembers or 0, MAX_MEMBERS_SCANNED) do
+        local m = C_LFGList.GetSearchResultPlayerInfo(id, i)
+        local classFile = m and Readable(m.classFilename, nil)
+        local level = m and Readable(m.level, nil)
+        local armor = classFile and ArmorType(classFile, level)
+        if armor then counts[armor] = counts[armor] + 1 end
+    end
+    return counts
+end
+
 local function SortValue(e)
     if sortKey == "level" then return e.avgLevel or 0 end
     return e.numMembers or 0
@@ -1235,12 +1324,21 @@ function Render()
             table.insert(list, e)
         end
     end
-    if sortKey then
+    -- "Fewest armor competition" comes first, the column sort breaks ties.
+    local armor = ActiveArmorSort()
+    if sortKey or armor then
         table.sort(list, function(a, b)
-            local va, vb = SortValue(a), SortValue(b)
-            if va ~= vb then
-                if sortDesc then return va > vb end
-                return va < vb
+            if armor then
+                local ca = a.armor and a.armor[armor] or 0
+                local cb = b.armor and b.armor[armor] or 0
+                if ca ~= cb then return ca < cb end
+            end
+            if sortKey then
+                local va, vb = SortValue(a), SortValue(b)
+                if va ~= vb then
+                    if sortDesc then return va > vb end
+                    return va < vb
+                end
             end
             return a.order < b.order
         end)
@@ -1400,6 +1498,8 @@ local function BuildEntry(id, info)
                 numMembers = type(numMembers) == "number" and numMembers or nil,
                 members = numMembers and tostring(numMembers) or "",
                 counts = Readable(C_LFGList.GetSearchResultMemberCounts(id), nil),
+                armor = (not isSolo) and CountArmor(id, numMembers) or nil,
+                classes = (not isSolo) and MemberClasses(id, numMembers) or nil,
             }
 end
 
@@ -1794,88 +1894,142 @@ local function BuildFilterWindow()
     -- Role / member ranges
     local roleHeader = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     local langDropdown = NS.CreateLanguageDropdown(filterWin, psDropdown)
-    roleHeader:SetPoint("TOPLEFT", langDropdown, "BOTTOMLEFT", 0, -22)
+
+    -- "Fewest armor competition": sorts groups by how few members wear an armor type.
+    -- Applies immediately (it is a sort, not a filter) and is saved.
+    local armorLabel = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    armorLabel:SetPoint("TOPLEFT", langDropdown, "BOTTOMLEFT", 0, -14)
+    armorLabel:SetText("Sort by fewest armor competition")
+
+    local armorDropdown = CreateFrame("DropdownButton", nil, filterWin, "WowStyle1DropdownTemplate")
+    armorDropdown:SetWidth(270)
+    armorDropdown:SetPoint("TOPLEFT", armorLabel, "BOTTOMLEFT", 0, -6)
+    -- Entries: Off, Cloth, Leather, Mail, Plate - the player's own type is marked
+    -- "(my armor type)". An old saved "MINE" counts as the own type.
+    local function ArmorLabel(key)
+        local label = ARMOR_LABELS[key]
+        if key == MyArmorType() then label = label .. " (my armor type)" end
+        return label
+    end
+    local function SelectedArmor()
+        local s = BetterLFGDB and BetterLFGDB.armorSort
+        if s == "MINE" then return MyArmorType() end
+        return ARMOR_LABELS[s] and s or nil
+    end
+    local function ArmorText()
+        local key = SelectedArmor()
+        return key and ArmorLabel(key) or "Off"
+    end
+    armorDropdown:SetDefaultText(ArmorText())
+    NS.UseSummaryText(armorDropdown, ArmorText)
+    local function SetArmorSort(value)
+        BetterLFGDB = BetterLFGDB or {}
+        BetterLFGDB.armorSort = value
+        armorDropdown:SetDefaultText(ArmorText())
+        Render()
+    end
+    armorDropdown:SetupMenu(function(_, root)
+        root:CreateRadio("Off", function() return SelectedArmor() == nil end, function() SetArmorSort("OFF") end)
+        for _, key in ipairs({ "CLOTH", "LEATHER", "MAIL", "PLATE" }) do
+            root:CreateRadio(ArmorLabel(key), function() return SelectedArmor() == key end,
+                function() SetArmorSort(key) end)
+        end
+    end)
+    armorDropdown:HookScript("OnEnter", function(self)
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetText("Sort by fewest armor competition", 1, 1, 1)
+        GameTooltip:AddLine("This only sorts the list - no group is hidden.", 0.4, 0.8, 1, true)
+        GameTooltip:AddLine("Groups with the fewest members wearing this armor type come first - less competition for loot.", 0.8, 0.8, 0.8, true)
+        GameTooltip:AddLine("Hunters and Shamans count as leather below level 40, Warriors and Paladins as mail.", 0.6, 0.6, 0.6, true)
+        GameTooltip:Show()
+    end)
+    armorDropdown:HookScript("OnLeave", GameTooltip_Hide)
+
+    -- Shown only while the option is on; the role section moves up when it is hidden.
+    local function UpdateArmorVisibility()
+        local on = ArmorFeatureOn()
+        armorLabel:SetShown(on)
+        armorDropdown:SetShown(on)
+        roleHeader:ClearAllPoints()
+        roleHeader:SetPoint("TOPLEFT", on and armorDropdown or langDropdown, "BOTTOMLEFT", 0, -22)
+    end
+    UpdateArmorVisibility()
+    NS.UpdateArmorVisibility = UpdateArmorVisibility
     roleHeader:SetText("Find groups by role")
 
-    -- One row per range: [x] [icon] Label ....... [from] to [to]
-    local rowsUI = {}
-    local defs = {
-        { field = "members", label = "Members .........." },
-        { field = "tank",    label = "Tanks ............", role = "TANK" },
-        { field = "healer",  label = "Heals ............", role = "HEALER" },
-        { field = "damage",  label = "DPS ..............", role = "DAMAGER" },
+    -- Two columns of checkboxes:   [x] Tank available     [x] Has tank
+    --                              [x] Healer available   [x] Has healer
+    --                              [x] DPS available
+    local roleChecks = {}
+    local ROLE_UI = {
+        { field = "tankAvailable",   role = "TANK",    label = "Tank available",   col = 0, row = 0,
+          tip = "Groups that still need a tank." },
+        { field = "hasTank",         role = "TANK",    label = "Has tank",         col = 1, row = 0,
+          tip = "Groups that already have a tank." },
+        { field = "healerAvailable", role = "HEALER",  label = "Healer available", col = 0, row = 1,
+          tip = "Groups that still need a healer." },
+        { field = "hasHealer",       role = "HEALER",  label = "Has healer",       col = 1, row = 1,
+          tip = "Groups that already have a healer." },
+        { field = "damageAvailable", role = "DAMAGER", label = "DPS available",    col = 0, row = 2,
+          tip = "Groups that still have room for a damage dealer (fewer than 3)." },
     }
-
-    local function MakeBox(parentFrame, field, bound)
-        local box = CreateFrame("EditBox", nil, parentFrame, "InputBoxTemplate")
-        box:SetSize(38, 20)
-        box:SetAutoFocus(false)
-        box:SetNumeric(true)
-        box:SetMaxLetters(2)
-        box:SetJustifyH("CENTER")
-        box:SetScript("OnTextChanged", function(self)
-            local text = self:GetText()
-            pending[field][bound] = text ~= "" and tonumber(text) or nil
-        end)
-        box:SetScript("OnEnterPressed", box.ClearFocus)
-        box:SetScript("OnEscapePressed", box.ClearFocus)
-        return box
-    end
-
-    local anchor, offsetY = roleHeader, -8
-    for _, d in ipairs(defs) do
-        local row = CreateFrame("Frame", nil, filterWin)
-        row:SetSize(280, 26)
-        row:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", anchor == roleHeader and -2 or 0, offsetY)
-
-        local cb = CreateFrame("CheckButton", nil, row, "UICheckButtonTemplate")
+    local COL_WIDTH, ROW_STEP = 150, 26
+    for _, d in ipairs(ROLE_UI) do
+        local cb = CreateFrame("CheckButton", nil, filterWin, "UICheckButtonTemplate")
         cb:SetSize(26, 26)
-        cb:SetPoint("LEFT", 0, 0)
-        cb:SetScript("OnClick", function(self)
-            pending[d.field].on = self:GetChecked() and true or false
-        end)
-
-        local labelAnchor = cb
-        if d.role then
-            local icon = row:CreateTexture(nil, "ARTWORK")
-            icon:SetSize(18, 18)
-            icon:SetTexture(ROLE_ICONS)
-            icon:SetTexCoord(unpack(ROLE_COORDS[d.role]))
-            icon:SetPoint("LEFT", cb, "RIGHT", 2, 0)
-            labelAnchor = icon
-        end
-        local text = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        text:SetPoint("LEFT", labelAnchor, "RIGHT", 4, 0)
-        text:SetWidth(d.role and 84 or 102)
-        text:SetJustifyH("LEFT")
+        cb:SetPoint("TOPLEFT", roleHeader, "BOTTOMLEFT", -2 + d.col * COL_WIDTH, -6 - d.row * ROW_STEP)
+        local icon = filterWin:CreateTexture(nil, "ARTWORK")
+        icon:SetSize(16, 16)
+        icon:SetTexture(ROLE_ICONS)
+        icon:SetTexCoord(unpack(ROLE_COORDS[d.role]))
+        icon:SetPoint("LEFT", cb, "RIGHT", 1, 0)
+        local text = filterWin:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+        text:SetPoint("LEFT", icon, "RIGHT", 4, 0)
         text:SetText(d.label)
-
-        local from = MakeBox(row, d.field, "min")
-        from:SetPoint("LEFT", text, "RIGHT", 8, 0)
-        local to = row:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
-        to:SetPoint("LEFT", from, "RIGHT", 6, 0)
-        to:SetText("to")
-        local upper = MakeBox(row, d.field, "max")
-        upper:SetPoint("LEFT", to, "RIGHT", 8, 0)
-
-        rowsUI[d.field] = { cb = cb, from = from, to = upper }
-        anchor, offsetY = row, -2
+        cb:SetChecked(pending.roles[d.field])
+        cb:SetScript("OnClick", function(self)
+            pending.roles[d.field] = self:GetChecked() and true or false
+        end)
+        cb:SetScript("OnEnter", function(self)
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetText(d.label, 1, 1, 1)
+            GameTooltip:AddLine(d.tip, 0.8, 0.8, 0.8, true)
+            GameTooltip:Show()
+        end)
+        cb:SetScript("OnLeave", GameTooltip_Hide)
+        roleChecks[d.field] = cb
     end
 
-    -- Show the restored values (LoadRoles ran before this window was built).
-    for field, ui in pairs(rowsUI) do
-        local p = pending[field]
-        ui.cb:SetChecked(p.on)
-        ui.from:SetText(p.min and tostring(p.min) or "")
-        ui.to:SetText(p.max and tostring(p.max) or "")
+    -- "No groups with...": hide groups that contain one of the ticked classes.
+    local classDropdown = CreateFrame("DropdownButton", nil, filterWin, "WowStyle1DropdownTemplate")
+    classDropdown:SetWidth(270)
+    classDropdown:SetPoint("TOPLEFT", roleHeader, "BOTTOMLEFT", 0, -12 - 3 * ROW_STEP)
+    local function ClassText()
+        local names = {}
+        for _, cls in ipairs(ClassOrder({})) do
+            if pending.hiddenGroupClasses[cls] then table.insert(names, ClassName(cls)) end
+        end
+        local text = (#names == 0 and "No groups with...") or ("No groups with: " .. table.concat(names, ", "))
+        classDropdown:SetDefaultText(text)
+        return text
     end
+    ClassText()
+    NS.UseSummaryText(classDropdown, ClassText)
+    classDropdown:SetupMenu(function(_, root)
+        for _, cls in ipairs(ClassOrder({})) do
+            root:CreateCheckbox((ClassMarkup(cls) or "") .. " " .. ClassName(cls),
+                function() return pending.hiddenGroupClasses[cls] == true end,
+                function()
+                    pending.hiddenGroupClasses[cls] = (not pending.hiddenGroupClasses[cls]) or nil
+                    ClassText()
+                end)
+        end
+    end)
 
     -- Bottom bar: [Reset] [gear] ................ [Search]
     local function ApplyFilters()
-        for _, k in ipairs(RANGE_KEYS) do
-            local p = pending[k]
-            filters[k] = { on = p.on, min = p.min, max = p.max }
-        end
+        filters.roles = CopySet(pending.roles)
+        filters.hiddenGroupClasses = CopySet(pending.hiddenGroupClasses)
         filters.levelOnly = pending.levelOnly
         filters.hiddenPlaystyles = CopySet(pending.hiddenPlaystyles)
         filters.ids = nil
@@ -1894,10 +2048,6 @@ local function BuildFilterWindow()
     searchBtn:SetPoint("BOTTOMRIGHT", -16, 14)
     searchBtn:SetText("Search")
     searchBtn:SetScript("OnClick", function()
-        for _, ui in pairs(rowsUI) do
-            ui.from:ClearFocus()
-            ui.to:ClearFocus()
-        end
         ApplyFilters()
         SaveRoles()
         Render()
@@ -1923,20 +2073,24 @@ local function BuildFilterWindow()
         UpdateDropdownText()
         NS.RefreshDropdown(dropdown)
         NS.RefreshDropdown(psDropdown)
+        -- Armor sort: off.
+        BetterLFGDB = BetterLFGDB or {}
+        BetterLFGDB.armorSort = "OFF"
+        armorDropdown:SetDefaultText("Off")
+        NS.RefreshDropdown(armorDropdown)
         -- Languages: all (shared with the players tab).
         NS.ResetLanguages()
         langDropdown.Refresh()
-        for _, ui in pairs(rowsUI) do
-            ui.cb:SetChecked(false)
-            ui.from:SetText("")
-            ui.to:SetText("")
-        end
+        for _, cb in pairs(roleChecks) do cb:SetChecked(false) end
+        ClassText()
+        NS.RefreshDropdown(classDropdown)
         SaveRoles()
         Render()
     end)
 
     -- The shared filters may have been changed in Find Players: show their current state.
     filterWin.SyncShared = function()
+        UpdateArmorVisibility()
         UpdateDropdownText()
         NS.RefreshDropdown(dropdown)
         levelCheck:SetChecked(pending.levelOnly)
